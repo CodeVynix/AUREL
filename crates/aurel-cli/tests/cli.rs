@@ -9,14 +9,21 @@ fn aurel() -> Command {
     Command::new(env!("CARGO_BIN_EXE_aurel"))
 }
 
+/// Expected `--version` line, derived from the shared version API rather than
+/// hard-coded, so the display and the test cannot silently drift.
+fn expected_version_line() -> String {
+    format!("aurel {}", aurel_core::version())
+}
+
 #[test]
 fn version_long_flag() {
     let output = aurel().arg("--version").output().expect("spawn aurel");
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8(output.stdout).expect("stdout UTF-8");
+    let expected = expected_version_line();
     assert!(
-        stdout.contains("aurel 0.1.0"),
-        "stdout must contain 'aurel 0.1.0', got: {stdout:?}"
+        stdout.contains(&expected),
+        "stdout must contain {expected:?}, got: {stdout:?}"
     );
 }
 
@@ -25,7 +32,8 @@ fn version_short_flag() {
     let output = aurel().arg("-V").output().expect("spawn aurel");
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8(output.stdout).expect("stdout UTF-8");
-    assert!(stdout.contains("aurel 0.1.0"), "got: {stdout:?}");
+    let expected = expected_version_line();
+    assert!(stdout.contains(&expected), "got: {stdout:?}");
 }
 
 #[test]

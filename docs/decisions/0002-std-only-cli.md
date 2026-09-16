@@ -2,8 +2,10 @@
 
 ## Decision
 
-Phase 0 parses arguments with `std::env::args` and a small `match`. No
-`clap`, no `lexopt`, no other CLI dependency.
+Phase 0 parses arguments with `std::env::args_os` plus an explicit lossy
+Unicode policy (`to_string_lossy`, then a small `match`). No `clap`, no
+`lexopt`, no other CLI dependency. Non-Unicode input therefore cannot panic
+the CLI; it flows through the normal parser to a deterministic usage error.
 
 ## Alternatives
 

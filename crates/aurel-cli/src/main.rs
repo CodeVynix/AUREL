@@ -1,14 +1,27 @@
 //! `aurel` CLI entry point (Phase 0).
 //!
-//! Dependency-free argument handling over `std::env::args`.
+//! Dependency-free argument handling over `std::env::args_os` with an
+//! explicit lossy Unicode policy (see [`normalize_args`]).
 //! Only `--version`/`-V` and `--help`/`-h` exist. All logic lives in [`run`]
 //! so it is unit-testable without spawning a subprocess. Integration tests
 //! in `tests/cli.rs` exercise the compiled binary end to end.
 
+use std::ffi::OsString;
 use std::io::Write;
 
 /// Exit code for CLI usage errors (unknown flags).
 const EXIT_USAGE_ERROR: i32 = 2;
+
+/// Policy for non-Unicode OS arguments: convert with `to_string_lossy`
+/// (unrepresentable sequences become U+FFFD) and continue through the normal
+/// parser. This never panics: `args_os` does not validate Unicode and
+/// `to_string_lossy` is total. A lossy argument simply fails to match a known
+/// flag and is handled as a deterministic usage error (exit 2).
+fn normalize_args(raw: &[OsString]) -> Vec<String> {
+    raw.iter()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect()
+}
 
 /// Render the Phase 0 help text to `out`.
 fn print_help(out: &mut dyn Write) -> std::io::Result<()> {
@@ -34,7 +47,8 @@ fn print_version(out: &mut dyn Write) -> std::io::Result<()> {
 
 /// Core CLI logic, testable without process spawning.
 ///
-/// * `args` — arguments excluding the program name (i.e. `env::args().skip(1)`).
+/// * `args` — normalized arguments excluding the program name (see
+///   [`normalize_args`]; `main` builds these from `env::args_os().skip(1)`).
 /// * Returns a process exit code: `0` on success, `2` on usage error,
 ///   `1` if writing output itself failed.
 fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
@@ -66,7 +80,8 @@ fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let raw: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let args = normalize_args(&raw);
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
     let mut out = stdout.lock();
@@ -130,5 +145,41 @@ mod tests {
         let (code, _out, err) = run_to_string(&["--wat"]);
         assert_eq!(code, EXIT_USAGE_ERROR);
         assert!(err.contains("--wat"));
+    }
+
+    /// Non-Unicode OS input for the current platform (bytes that are invalid
+    /// UTF-8 and would make `std::env::args()` panic).
+    #[cfg(unix)]
+    fn non_unicode_arg() -> OsString {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec(vec![0xFF, b'x'])
+    }
+
+    /// Non-Unicode OS input for the current platform (an unpaired surrogate,
+    /// which is not valid Unicode).
+    #[cfg(windows)]
+    fn non_unicode_arg() -> OsString {
+        use std::os::windows::ffi::OsStringExt;
+        OsString::from_wide(&[0xD800, b'x' as u16])
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn non_unicode_arg() -> OsString {
+        // Fallback: no portable invalid-Unicode constructor here, so exercise
+        // the conversion path with a plain argument instead.
+        OsString::from("--wat")
+    }
+
+    #[test]
+    fn non_unicode_argument_is_handled_without_panic() {
+        // Regression test: the args_os -> lossy conversion path must be total.
+        let args = normalize_args(&[non_unicode_arg()]);
+        assert_eq!(args.len(), 1);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run(&args, &mut out, &mut err);
+        // Lossy output matches no known flag, so it is a usage error — the
+        // point is that reaching this assertion proves no panic occurred.
+        assert_eq!(code, EXIT_USAGE_ERROR);
     }
 }
