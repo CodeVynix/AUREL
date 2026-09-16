@@ -30,28 +30,33 @@ committed because the workspace produces a binary.
 
 `crates/aurel-cli/src/args.rs` implements the Phase 1 grammar dependency-free
 over already-normalized `String` arguments (see ADR-0004); `src/main.rs`
-dispatches. `run(args, out, err, rt) -> i32` takes an injectable `Runtime`
-(working directory, `%APPDATA%`/`$HOME`, filtered `AUREL_*` env) so
-precedence is unit-testable without touching real user state;
-`tests/config.rs` covers the compiled binary via `CARGO_BIN_EXE_aurel` with
-isolated temp homes and working directories:
+dispatches. The live `Runtime` (working directory, `%APPDATA%`/`$HOME`,
+filtered `AUREL_*` env) is constructed lazily, only on the command path —
+help/version/bare invocations never touch environment or config state, so
+they stay independent of configuration/environment failures. For tests,
+`run_with` injects a fake `Runtime`, keeping precedence unit-testable
+without touching real user state; `tests/config.rs` covers the compiled
+binary via `CARGO_BIN_EXE_aurel` with isolated temp homes and working
+directories:
 
 - empty args / `-h` / `--help` → top help to stdout, exit 0, config untouched
 - `-V` / `--version` → `aurel <version>` to stdout, exit 0, config untouched
   (version comes from `aurel_core::version()`, single source of truth)
 - `config show` → effective TOML to stdout, exit 0
-- `config --help` → command help, exit 0
+- `config` / `config --help` → command help, exit 0
 - unknown flags/commands, bad values, `--version` + command → stderr, exit 2
+  (usage errors take precedence over `--help`: help prints only when the
+  surrounding command line is valid)
 - malformed TOML / bad file values (path included) / bad `AUREL_LOG_LEVEL` /
   missing `--config` file → stderr, exit 1
 
 No color, no terminal requirements, safe under pipes. IO failures return
-exit 1 instead of panicking, and the argument-conversion path itself is
-total (`args_os` performs no Unicode validation, `to_string_lossy` cannot
-fail), so non-Unicode input is handled deterministically with no panic in
-crate-controlled logic. No `unwrap`/`expect` exists on the runtime paths
-(only in tests). No broader claim is made about std/OS internals
-outside this crate's control.
+exit 1 instead of panicking. Both OS-input paths are total: `args_os` +
+lossy conversion for argv, `vars_os` + key-filter/lossy-value policy for the
+environment (`collect_aurel_env`), so non-Unicode argv or environment data
+is handled deterministically with no panic in crate-controlled logic.
+No `unwrap`/`expect` exists on the runtime paths (only in tests). No broader
+claim is made about std/OS internals outside this crate's control.
 
 ## Configuration
 
@@ -59,6 +64,8 @@ One real setting (`log_level`, default `info`) with full precedence
 machinery: defaults < global file < project file < env < CLI, plus
 `--config` replacing discovery. Files are TOML parsed with unknown-field
 rejection; missing files are skipped except an explicit `--config` path.
+`config show` reports each layer honestly, including the three project
+states (found path / `searched, none found` / `not searched`).
 Details, grammar, and error tables live in `docs/configuration.md`, which
 is the normative reference — this file only summarizes.
 

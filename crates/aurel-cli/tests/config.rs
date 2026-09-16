@@ -84,6 +84,13 @@ fn show_defaults_when_no_config_exists() {
     let stdout = stdout_text(&output);
     assert!(stdout.contains("log_level = \"info\""), "got: {stdout:?}");
     assert!(stdout.contains("not found"), "got: {stdout:?}");
+    // The project layer must be explicitly reported absent: this proves the
+    // test did not accidentally inherit an ancestor `.aurel/config.toml`
+    // through upward discovery.
+    assert!(
+        stdout.contains("# project: searched, none found"),
+        "got: {stdout:?}"
+    );
 }
 
 #[test]
@@ -446,4 +453,152 @@ fn version_with_command_is_exit_2() {
     .output()
     .expect("spawn aurel");
     assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn bare_config_prints_config_help() {
+    let root = test_root("bare-config");
+    let home = root.join("home");
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).expect("work");
+
+    let output = isolated(aurel().current_dir(&work).arg("config"), &home)
+        .output()
+        .expect("spawn aurel");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&output)
+    );
+    let stdout = stdout_text(&output);
+    assert!(stdout.contains("aurel config show"), "got: {stdout:?}");
+}
+
+#[test]
+fn config_help_banner_names_aurel() {
+    let root = test_root("config-help");
+    let home = root.join("home");
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).expect("work");
+
+    let output = isolated(
+        aurel().current_dir(&work).arg("config").arg("--help"),
+        &home,
+    )
+    .output()
+    .expect("spawn aurel");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&output)
+    );
+    let stdout = stdout_text(&output);
+    let expected = format!("aurel {}", aurel_core::version());
+    assert!(
+        stdout.lines().next() == Some(expected.as_str()),
+        "banner must be the user-facing binary name, got: {stdout:?}"
+    );
+}
+
+#[test]
+fn usage_error_beats_help_flag() {
+    let root = test_root("help-with-bad-flag");
+    let home = root.join("home");
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).expect("work");
+
+    // An invalid command line exits 2 even with --help present: help is only
+    // printed when the surrounding command line is valid.
+    let output = isolated(aurel().current_dir(&work).arg("--help").arg("--wat"), &home)
+        .output()
+        .expect("spawn aurel");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout: {}",
+        stdout_text(&output)
+    );
+}
+
+#[test]
+fn version_and_help_ignore_broken_config_and_env() {
+    let root = test_root("help-immune");
+    let home = root.join("home");
+    let work = root.join("work");
+    write_file(
+        &work.join(".aurel").join("config.toml"),
+        "log_level = [oops\n",
+    );
+
+    // Even with malformed config files and an invalid AUREL_LOG_LEVEL,
+    // help/version never touch configuration or environment state.
+    for argv in [
+        &["--version"] as &[&str],
+        &["-V"],
+        &["--help"],
+        &["-h"],
+        &["config"],
+    ] {
+        let mut cmd = aurel();
+        cmd.current_dir(&work).env("AUREL_LOG_LEVEL", "chatty");
+        for arg in argv {
+            cmd.arg(arg);
+        }
+        let output = isolated(&mut cmd, &home).output().expect("spawn aurel");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "argv {argv:?} must ignore broken config/env, stderr: {}",
+            stderr_text(&output)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_unicode_env_value_is_rejected_without_panic() {
+    use std::os::unix::ffi::OsStrExt;
+    let root = test_root("non-unicode-env");
+    let home = root.join("home");
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).expect("work");
+    let bad = std::ffi::OsStr::from_bytes(b"\xff");
+
+    // Raw non-UTF-8 in AUREL_LOG_LEVEL: deterministic rejection (exit 1),
+    // never the exit-101 panic that `std::env::vars()` produced.
+    let output = isolated(
+        aurel()
+            .current_dir(&work)
+            .env("AUREL_LOG_LEVEL", bad)
+            .arg("config")
+            .arg("show"),
+        &home,
+    )
+    .output()
+    .expect("spawn aurel");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout: {}",
+        stdout_text(&output)
+    );
+    assert!(
+        stderr_text(&output).contains("AUREL_LOG_LEVEL"),
+        "got: {:?}",
+        stderr_text(&output)
+    );
+
+    // And --version stays independent of the broken environment.
+    let output = isolated(
+        aurel()
+            .current_dir(&work)
+            .env("AUREL_LOG_LEVEL", bad)
+            .arg("--version"),
+        &home,
+    )
+    .output()
+    .expect("spawn aurel");
+    assert_eq!(output.status.code(), Some(0));
 }

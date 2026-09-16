@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Terminal CLI for AUREL Core (Phase 0: --version/--help only)"
+description = "Terminal CLI for AUREL Core (Phase 1: argument parsing, TOML config, config show)"
 
 [[bin]]
 name = "aurel"

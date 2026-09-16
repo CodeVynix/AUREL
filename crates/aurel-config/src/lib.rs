@@ -125,10 +125,15 @@ pub struct EffectiveConfig {
     pub global_file: Option<PathBuf>,
     /// Whether the global file existed and was applied.
     pub global_found: bool,
-    /// Discovered project file path, if the search ran.
+    /// Discovered project file path, if the search ran and found one.
+    /// `None` together with `project_searched == true` means the search ran
+    /// and found nothing; with `false` it means no search ran (`--config`).
     pub project_file: Option<PathBuf>,
     /// Whether the project file existed and was applied.
     pub project_found: bool,
+    /// Whether project discovery ran at all. Distinguishes "not searched"
+    /// (`--config` given) from "searched, none found" in diagnostics.
+    pub project_searched: bool,
     /// Explicit `--config` path, if given. A missing explicit file is an
     /// error, so when loading succeeds this file was applied.
     pub explicit_file: Option<PathBuf>,
@@ -140,8 +145,13 @@ pub struct EffectiveConfig {
 pub struct LoadRequest {
     /// Global file to read, if any. `None` skips the layer.
     pub global_file: Option<PathBuf>,
-    /// Project file to read, if any. `None` skips the layer.
+    /// Project file to read, if discovery found one. `None` skips the layer;
+    /// set `project_searched` to record whether discovery ran.
     pub project_file: Option<PathBuf>,
+    /// Whether project discovery ran. `false` (e.g. `--config` replaces
+    /// discovery) renders as "not searched"; `true` with no `project_file`
+    /// renders as "searched, none found".
+    pub project_searched: bool,
     /// Explicit `--config` file. Must exist when set.
     pub explicit_file: Option<PathBuf>,
     /// Injected environment (production passes the filtered process env).
@@ -285,8 +295,35 @@ pub fn load(req: &LoadRequest) -> Result<EffectiveConfig, ConfigError> {
         global_found,
         project_file: req.project_file.clone(),
         project_found,
+        project_searched: req.project_searched,
         explicit_file: req.explicit_file.clone(),
     })
+}
+
+/// Environment conversion policy: collect the `AUREL_*` subset of raw OS
+/// environment entries without panicking on non-Unicode data.
+///
+/// - Keys must decode as Unicode to participate; a non-Unicode key is
+///   ignored. This is safe because every recognized name is pure ASCII: an
+///   undecodable key cannot name a real setting.
+/// - Values use lossy conversion (`to_string_lossy`): undecodable sequences
+///   become U+FFFD and flow into normal validation, so a bad value is a
+///   deterministic [`ConfigError::InvalidEnv`], never a panic.
+///
+/// Takes the raw iterator (production passes `std::env::vars_os()`) so the
+/// policy is unit-testable with platform-constructed non-Unicode values.
+pub fn collect_aurel_env(
+    vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> HashMap<String, String> {
+    vars.filter_map(|(key, value)| {
+        let key = key.into_string().ok()?;
+        if key == ENV_LOG_LEVEL || key.starts_with("AUREL_") {
+            Some((key, value.to_string_lossy().into_owned()))
+        } else {
+            None
+        }
+    })
+    .collect()
 }
 
 /// Resolve the global config path from already-read directory values.
@@ -342,11 +379,7 @@ pub fn render_show(cfg: &EffectiveConfig) -> String {
         &cfg.global_file,
         cfg.global_found,
     ));
-    out.push_str(&show_source_line(
-        "project",
-        &cfg.project_file,
-        cfg.project_found,
-    ));
+    out.push_str(&show_project_line(cfg));
     if let Some(path) = &cfg.explicit_file {
         out.push_str(&format!("# explicit: {}\n", path.display()));
     }
@@ -359,6 +392,18 @@ fn show_source_line(kind: &str, path: &Option<PathBuf>, found: bool) -> String {
         None => format!("# {kind}: not searched\n"),
         Some(p) if found => format!("# {kind}: {}\n", p.display()),
         Some(p) => format!("# {kind}: {} (not found)\n", p.display()),
+    }
+}
+
+/// Project layer diagnostic with three honest states: the discovered path
+/// when found, "searched, none found" when discovery ran empty, and
+/// "not searched" when discovery was replaced (explicit `--config`).
+fn show_project_line(cfg: &EffectiveConfig) -> String {
+    match (&cfg.project_file, cfg.project_found, cfg.project_searched) {
+        (Some(path), true, _) => format!("# project: {}\n", path.display()),
+        (Some(path), false, _) => format!("# project: {} (not found)\n", path.display()),
+        (None, _, true) => "# project: searched, none found\n".to_string(),
+        (None, _, false) => "# project: not searched\n".to_string(),
     }
 }
 
@@ -547,11 +592,101 @@ mod tests {
             global_found: false,
             project_file: Some(PathBuf::from("/p/.aurel/config.toml")),
             project_found: true,
+            project_searched: true,
             explicit_file: None,
         };
         let text = render_show(&cfg);
         assert!(text.contains("log_level = \"debug\""));
         assert!(text.contains("# global: /g/config.toml (not found)"));
         assert!(text.contains("# project: /p/.aurel/config.toml"));
+    }
+
+    #[test]
+    fn render_show_distinguishes_project_search_states() {
+        // Searched and empty: must not claim "not searched".
+        let searched_empty = EffectiveConfig {
+            log_level: LogLevel::Info,
+            global_file: Some(PathBuf::from("/g/config.toml")),
+            global_found: false,
+            project_file: None,
+            project_found: false,
+            project_searched: true,
+            explicit_file: None,
+        };
+        let text = render_show(&searched_empty);
+        assert!(
+            text.contains("# project: searched, none found"),
+            "got: {text:?}"
+        );
+        assert!(!text.contains("not searched"), "got: {text:?}");
+
+        // Discovery replaced by --config: honestly "not searched".
+        let not_searched = EffectiveConfig {
+            project_searched: false,
+            explicit_file: Some(PathBuf::from("/c/custom.toml")),
+            ..searched_empty.clone()
+        };
+        let text = render_show(&not_searched);
+        assert!(text.contains("# project: not searched"), "got: {text:?}");
+        assert!(text.contains("# explicit: /c/custom.toml"), "got: {text:?}");
+    }
+
+    /// Non-Unicode OS string for the current platform.
+    #[cfg(unix)]
+    fn non_unicode_os(text: &[u8]) -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(text.to_vec())
+    }
+
+    /// Non-Unicode OS string for the current platform (an unpaired
+    /// surrogate, which is not valid Unicode).
+    #[cfg(windows)]
+    fn non_unicode_os(_text: &[u8]) -> std::ffi::OsString {
+        use std::os::windows::ffi::OsStringExt;
+        std::ffi::OsString::from_wide(&[0xD800, b'x' as u16])
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn non_unicode_os(_text: &[u8]) -> std::ffi::OsString {
+        std::ffi::OsString::from("--wat")
+    }
+
+    #[test]
+    fn env_collection_never_panics_on_non_unicode_data() {
+        // Regression test: the vars_os -> filter/lossy path must be total.
+        let vars = vec![
+            (
+                std::ffi::OsString::from("AUREL_LOG_LEVEL"),
+                non_unicode_os(b"\xff"),
+            ),
+            (non_unicode_os(b"\xff"), std::ffi::OsString::from("debug")),
+            (
+                std::ffi::OsString::from("UNRELATED"),
+                non_unicode_os(b"\xff"),
+            ),
+            (
+                std::ffi::OsString::from("AUREL_LOG_LEVEL_OK"),
+                std::ffi::OsString::from("warn"),
+            ),
+        ];
+        // Reaching the assertions proves no panic occurred.
+        let env = collect_aurel_env(vars.into_iter());
+        // Non-Unicode key: ignored, never surfaces under a decoded name.
+        assert!(!env.keys().any(|k| k.contains('\u{FFFD}')));
+        // Unrelated names (even non-Unicode values) are not collected.
+        assert!(!env.contains_key("UNRELATED"));
+        assert_eq!(env.get("AUREL_LOG_LEVEL_OK"), Some(&"warn".to_string()));
+        #[cfg(any(unix, windows))]
+        {
+            // Lossy value is present and deterministically invalid, so
+            // loading rejects it with InvalidEnv instead of panicking.
+            let value = env.get(ENV_LOG_LEVEL).expect("lossy value collected");
+            assert!(value.contains('\u{FFFD}'), "got: {value:?}");
+            let req = LoadRequest {
+                env,
+                ..LoadRequest::default()
+            };
+            assert!(matches!(load(&req), Err(ConfigError::InvalidEnv { .. })));
+        }
     }
 }

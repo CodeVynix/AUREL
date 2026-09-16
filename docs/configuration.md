@@ -39,7 +39,11 @@ CLI arguments
   / `$HOME`; if the variable is absent the layer is skipped.
 - **Project file:** nearest `.aurel/config.toml` at or above the working
   directory (bounded 64-level walk, stops at the filesystem root).
-- **Environment:** `AUREL_LOG_LEVEL` overrides both files.
+- **Environment:** `AUREL_LOG_LEVEL` overrides both files. Collection uses
+  `vars_os`, so non-Unicode environment data cannot panic the process:
+  non-Unicode keys are ignored (recognized names are pure ASCII), values
+  are lossy-converted and flow into normal validation (a bad value is exit
+  1, never a panic).
 - **CLI:** `--log-level <level>` overrides everything.
 - Missing files are skipped silently. `--config <path>` replaces file
   discovery: only that file is read (plus env and CLI above it); a missing
@@ -58,18 +62,24 @@ OPTIONS:
 
 COMMANDS:
     config show    Print the effective configuration
+    config         Print the `config` command help (same as `config --help`)
 ```
 
 Grammar notes: `--flag=value` and `--flag value` both work; only exact
-`-h`/`-V` (no combined shorts, no abbreviations); `--help` wins over
-everything else; `--version` combined with a command is a usage error; a
-`--` token ends flag parsing. A bare `aurel` prints help without reading
-config files.
+`-h`/`-V` (no combined shorts, no abbreviations); `--help` is printed only
+when the surrounding command line is valid — a usage error anywhere in the
+line takes precedence and exits 2; `--version` combined with a command is a
+usage error; a `--` token ends flag parsing. A bare `aurel` prints help
+without reading config files. `--help`, `--version`, bare `aurel`, and bare
+`config` never construct runtime state, so they stay independent of broken
+config files or environment data.
 
 ## `config show`
 
-Prints `#` comment lines describing each file layer (path, `not found`,
-or `not searched`) followed by the effective settings as TOML:
+Prints `#` comment lines describing each file layer followed by the
+effective settings as TOML. The project layer reports three honest states:
+the discovered path, `searched, none found` (discovery ran empty), or
+`not searched` (discovery replaced by `--config`):
 
 ```text
 # aurel effective configuration (TOML)

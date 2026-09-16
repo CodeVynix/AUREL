@@ -88,7 +88,7 @@ Behavior:
 | `aurel --help` / `-h` | 0 | help to stdout |
 | `aurel --version` / `-V` | 0 | `aurel 0.2.0` to stdout |
 | `aurel config show` | 0 | effective config as TOML to stdout |
-| `aurel config --help` | 0 | command help to stdout |
+| `aurel config` / `aurel config --help` | 0 | command help to stdout |
 | `aurel --wat` / `aurel frobnicate` / `--log-level bogus` | 2 | usage error to stderr |
 | `aurel config show` with malformed TOML | 1 | config error (with file path) to stderr |
 | `aurel --config missing.toml config show` | 1 | `config file not found` to stderr |

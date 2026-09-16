@@ -15,11 +15,13 @@
 //! Commands:
 //!
 //! - `config show` — print the effective configuration and exit 0.
-//! - `config --help` — print command help and exit 0.
+//! - `config --help`, or bare `config` — print command help and exit 0.
 //!
 //! Rules:
 //!
 //! - Parsing stops at the first error; every usage error exits with code 2.
+//!   Usage errors take precedence over `--help`: help is printed only when
+//!   the surrounding command line itself is valid.
 //! - Only exact `-h` / `-V` are accepted: no combined short flags, no
 //!   abbreviations, no `--` long-prefix matching.
 //! - A `--` token ends flag parsing; the next token is a command or error.
@@ -187,6 +189,11 @@ pub fn parse(args: &[String]) -> Result<Parsed, ParseError> {
     if out.version && command_seen {
         return Err(ParseError::VersionWithCommand);
     }
+    // Bare `config` (no subcommand, no explicit help) prints the command
+    // help, consistent with `config --help`.
+    if command_seen && out.command.is_none() && out.help.is_none() {
+        out.help = Some(HelpTopic::Config);
+    }
     Ok(out)
 }
 
@@ -218,6 +225,21 @@ mod tests {
     fn config_show_parses() {
         let parsed = parse(&args(&["config", "show"])).expect("config show");
         assert_eq!(parsed.command, Some(Command::ConfigShow));
+    }
+
+    #[test]
+    fn bare_config_requests_config_help() {
+        let parsed = parse(&args(&["config"])).expect("bare config");
+        assert_eq!(parsed.help, Some(HelpTopic::Config));
+        assert_eq!(parsed.command, None);
+    }
+
+    #[test]
+    fn usage_error_beats_help() {
+        // The parser stops at the first error: an invalid command line exits
+        // 2 even when --help is present.
+        assert!(parse(&args(&["--help", "--wat"])).is_err());
+        assert!(parse(&args(&["--wat", "--help"])).is_err());
     }
 
     #[test]

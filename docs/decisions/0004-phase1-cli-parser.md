@@ -22,7 +22,9 @@ both with `--flag=value` form), one command (`config`), one subcommand
 deterministic grammar documented in `docs/configuration.md`:
 
 - global-flag zone, then at most one command word, then command args
-- `--help` wins everywhere (exit 0, config files untouched)
+- `--help` is printed when the command line is otherwise valid (exit 0,
+  config files untouched); a usage error anywhere in the line takes
+  precedence and exits 2 (the parser stops at the first error)
 - `--version` with anything but global flags is a usage error (exit 2)
 - unknown flags, missing values, bad values, unknown commands are exit 2
 - no combined short flags, no abbreviations, no shell completion

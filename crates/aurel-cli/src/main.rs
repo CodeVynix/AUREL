@@ -3,10 +3,31 @@
 //! Phase 1: dependency-free argument handling ([`args`]) over
 //! `std::env::args_os` with an explicit lossy Unicode policy (see
 //! [`normalize_args`]), TOML configuration with documented precedence
-//! (`aurel-config`), and a `config show` command. All branching lives in
-//! [`run`], which takes an injectable [`Runtime`] so precedence is testable
-//! without touching the real home directory or process environment.
-//! Integration tests in `tests/` exercise the compiled binary end to end.
+//! (`aurel-config`), and a `config show` command.
+//!
+//! Conceptual flow:
+//!
+//! ```text
+//! collect argv (args_os, never panics on non-Unicode)
+//!     ↓
+//! parse CLI
+//!     ↓
+//! --help → print help and exit (config/environment untouched)
+//! --version → print version and exit (config/environment untouched)
+//! bare / no command → print help and exit (config/environment untouched)
+//! otherwise
+//!     ↓
+//! construct live Runtime (vars_os + lossy env policy, no panic)
+//!     ↓
+//! load configuration
+//!     ↓
+//! execute command
+//! ```
+//!
+//! All branching lives in [`run_inner`], which takes an optional injectable
+//! [`Runtime`] ([`run_with`]) so precedence is testable without touching the
+//! real home directory or process environment. Integration tests in `tests/`
+//! exercise the compiled binary end to end.
 
 mod args;
 
@@ -17,7 +38,7 @@ use std::path::PathBuf;
 
 use args::{Command, HelpTopic};
 use aurel_config::{
-    discover_project_file, global_config_file, load, render_show, LoadRequest, ENV_LOG_LEVEL,
+    collect_aurel_env, discover_project_file, global_config_file, load, render_show, LoadRequest,
 };
 
 /// Exit code for CLI usage errors (unknown flags, bad commands/values).
@@ -46,16 +67,19 @@ struct Runtime {
 }
 
 impl Runtime {
-    /// Capture the real process state.
+    /// Capture the real process state without panicking on non-Unicode data.
+    ///
+    /// Environment collection uses `vars_os` plus [`collect_aurel_env`]:
+    /// non-Unicode keys are ignored (recognized names are pure ASCII, so an
+    /// undecodable key cannot name a real setting) and values are
+    /// lossy-converted, flowing into normal validation. Directory lookups
+    /// use the non-panicking `var(...).ok()` form.
     fn live() -> Self {
-        let env: HashMap<String, String> = std::env::vars()
-            .filter(|(k, _)| k == ENV_LOG_LEVEL || k.starts_with("AUREL_"))
-            .collect();
         Runtime {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             appdata: std::env::var("APPDATA").ok(),
             home: std::env::var("HOME").ok(),
-            env,
+            env: collect_aurel_env(std::env::vars_os()),
         }
     }
 }
@@ -107,7 +131,7 @@ fn print_help(out: &mut dyn Write) -> std::io::Result<()> {
 
 /// Render the `config` command help text to `out`.
 fn print_config_help(out: &mut dyn Write) -> std::io::Result<()> {
-    writeln!(out, "aurel-config {}", aurel_core::version())?;
+    writeln!(out, "aurel {}", aurel_core::version())?;
     writeln!(out)?;
     writeln!(out, "USAGE:")?;
     writeln!(out, "    aurel config show")?;
@@ -129,20 +153,24 @@ fn print_version(out: &mut dyn Write) -> std::io::Result<()> {
 }
 
 /// Build the config [`LoadRequest`] for a parsed command line. An explicit
-/// `--config` path replaces global/project discovery; otherwise both are
-/// discovered from the runtime.
+/// `--config` path replaces global/project discovery (`project_searched` is
+/// then false, rendering "not searched"); otherwise both are discovered
+/// from the runtime (`project_searched` true, rendering the found path or
+/// "searched, none found").
 fn build_request(parsed: &args::Parsed, rt: &Runtime) -> LoadRequest {
-    let (global_file, project_file, explicit_file) = match &parsed.config_path {
-        Some(path) => (None, None, Some(path.clone())),
+    let (global_file, project_file, project_searched, explicit_file) = match &parsed.config_path {
+        Some(path) => (None, None, false, Some(path.clone())),
         None => (
             global_config_file(rt.appdata.as_deref(), rt.home.as_deref()),
             discover_project_file(&rt.cwd),
+            true,
             None,
         ),
     };
     LoadRequest {
         global_file,
         project_file,
+        project_searched,
         explicit_file,
         env: rt.env.clone(),
         cli_log_level: parsed.log_level,
@@ -151,11 +179,27 @@ fn build_request(parsed: &args::Parsed, rt: &Runtime) -> LoadRequest {
 
 /// Core CLI logic, testable without process spawning.
 ///
-/// `--help`/`--version` short-circuit before any config file is read. A bare
-/// invocation prints top-level help (Phase 0 behavior) without reading
-/// config. Returns a process exit code: `0` on success, `2` on usage error,
-/// `1` on configuration/runtime failure or output failure.
-fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write, rt: &Runtime) -> i32 {
+/// `--help`/`--version`/bare invocations short-circuit before any runtime
+/// state (environment, config files) is touched, so they stay independent
+/// of configuration/environment failures. Returns a process exit code:
+/// `0` on success, `2` on usage error, `1` on configuration/runtime failure
+/// or output failure.
+fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    run_inner(args, out, err, None)
+}
+
+/// [`run`] with an injected [`Runtime`] for tests.
+#[cfg(test)]
+fn run_with(args: &[String], out: &mut dyn Write, err: &mut dyn Write, rt: &Runtime) -> i32 {
+    run_inner(args, out, err, Some(rt))
+}
+
+fn run_inner(
+    args: &[String],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    rt: Option<&Runtime>,
+) -> i32 {
     let parsed = match args::parse(args) {
         Ok(parsed) => parsed,
         Err(e) => {
@@ -185,19 +229,35 @@ fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write, rt: &Runtime) 
                 1
             }
         }
-        Some(Command::ConfigShow) => match load(&build_request(&parsed, rt)) {
-            Ok(cfg) => {
-                if writeln!(out, "{}", render_show(&cfg)).is_ok() {
-                    0
-                } else {
-                    1
-                }
-            }
-            Err(e) => {
-                let _ = writeln!(err, "{e}");
-                EXIT_RUNTIME_ERROR
+        // Command path: only here is the live runtime constructed.
+        Some(Command::ConfigShow) => match rt {
+            Some(injected) => execute_config_show(&parsed, out, err, injected),
+            None => {
+                let live = Runtime::live();
+                execute_config_show(&parsed, out, err, &live)
             }
         },
+    }
+}
+
+fn execute_config_show(
+    parsed: &args::Parsed,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    rt: &Runtime,
+) -> i32 {
+    match load(&build_request(parsed, rt)) {
+        Ok(cfg) => {
+            if writeln!(out, "{}", render_show(&cfg)).is_ok() {
+                0
+            } else {
+                1
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(err, "{e}");
+            EXIT_RUNTIME_ERROR
+        }
     }
 }
 
@@ -208,7 +268,9 @@ fn main() {
     let stderr = std::io::stderr();
     let mut out = stdout.lock();
     let mut err = stderr.lock();
-    let code = run(&args, &mut out, &mut err, &Runtime::live());
+    // Note: the live Runtime is constructed lazily inside `run`, only on the
+    // command path — help/version/bare never touch environment or config.
+    let code = run(&args, &mut out, &mut err);
     // Ensure buffered output is flushed before exiting with a code.
     let _ = out.flush();
     let _ = err.flush();
@@ -232,7 +294,7 @@ mod tests {
         let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run(&owned, &mut out, &mut err, rt);
+        let code = run_with(&owned, &mut out, &mut err, rt);
         (
             code,
             String::from_utf8(out).expect("stdout must be UTF-8"),
@@ -357,6 +419,48 @@ mod tests {
     }
 
     #[test]
+    fn help_version_and_bare_ignore_broken_runtime_state() {
+        // Help/version/bare paths never touch environment or config files,
+        // so they succeed even when the runtime state would fail loading.
+        let dir =
+            std::env::temp_dir().join(format!("aurel-cli-test-{}-broken-rt", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let proj = dir.join(".aurel");
+        std::fs::create_dir_all(&proj).expect("test dirs");
+        std::fs::write(proj.join("config.toml"), "log_level = [oops\n").expect("test config");
+        let mut env = HashMap::new();
+        env.insert("AUREL_LOG_LEVEL".to_string(), "chatty".to_string());
+        let rt = Runtime {
+            cwd: dir.clone(),
+            appdata: None,
+            home: None,
+            env,
+        };
+        for argv in [
+            vec![],
+            vec!["--help"],
+            vec!["-h"],
+            vec!["--version"],
+            vec!["-V"],
+            vec!["config"],
+            vec!["config", "--help"],
+        ] {
+            let (code, _out, _err) = run_to_string(&argv, &rt);
+            assert_eq!(code, 0, "argv {argv:?} must not touch broken runtime state");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bare_config_prints_config_help() {
+        let rt = test_runtime();
+        let (code, out, err) = run_to_string(&["config"], &rt);
+        assert_eq!(code, 0);
+        assert!(out.contains("aurel config show"), "got: {out:?}");
+        assert!(err.is_empty());
+    }
+
+    #[test]
     fn non_unicode_argument_is_handled_without_panic() {
         // Regression test: the args_os -> lossy conversion path must be total.
         let raw = vec![non_unicode_arg()];
@@ -365,7 +469,7 @@ mod tests {
         let rt = test_runtime();
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run(&args, &mut out, &mut err, &rt);
+        let code = run_with(&args, &mut out, &mut err, &rt);
         // Lossy output matches no known flag or command, so it is a usage
         // error — reaching this assertion proves no panic occurred.
         assert_eq!(code, EXIT_USAGE_ERROR);
