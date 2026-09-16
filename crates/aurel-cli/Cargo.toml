@@ -1,0 +1,14 @@
+[package]
+name = "aurel-cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98.1"
+license = "MIT OR Apache-2.0"
+description = "Terminal CLI for AUREL Core (Phase 0: --version/--help only)"
+
+[[bin]]
+name = "aurel"
+path = "src/main.rs"
+
+[dependencies]
+aurel-core = { path = "../aurel-core" }

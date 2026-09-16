@@ -1,0 +1,11 @@
+[package]
+name = "aurel-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98.1"
+license = "MIT OR Apache-2.0"
+description = "Shared Rust foundation for AUREL Core (Phase 0: version API only)"
+
+[lib]
+name = "aurel_core"
+path = "src/lib.rs"

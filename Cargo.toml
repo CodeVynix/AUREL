@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aurel-core",
+    "crates/aurel-cli",
+]
