@@ -1,0 +1,21 @@
+# Build output
+/target/
+**/target/
+
+# Env / secrets (never commit)
+.env
+.env.*
+
+# AUREL runtime / project state
+.aurel/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+Desktop.ini
