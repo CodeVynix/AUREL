@@ -1,0 +1,17 @@
+[package]
+name = "aurel-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "TOML configuration loading and precedence for AUREL"
+
+[lib]
+name = "aurel_config"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# Only parsing is needed (`toml::from_str`); the `display` serialization side
+# is deliberately off to keep the Core footprint down (see ADR-0005).
+toml = { version = "0.8", default-features = false, features = ["parse"] }
