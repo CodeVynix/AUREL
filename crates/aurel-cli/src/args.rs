@@ -1,4 +1,4 @@
-//! Phase 1 argument grammar (dependency-free, total, deterministic).
+//! Phase 2 argument grammar (dependency-free, total, deterministic).
 //!
 //! ```text
 //! aurel [GLOBAL FLAGS] [COMMAND] [COMMAND ARGS]
@@ -11,11 +11,22 @@
 //!   files. Combining it with a command is a usage error.
 //! - `--config <path>` — replace file discovery with exactly this file.
 //! - `--log-level <level>` — `error|warn|info|debug|trace` (case-insensitive).
+//! - `--model <name>` — model id for `chat`.
+//! - `--base-url <url>` — endpoint root for `chat`.
+//! - `--streaming <bool>` — `true`/`false` (case-insensitive).
+//!
+//! There is deliberately no `--api-key` flag: keys in argv leak into shell
+//! history and process listings. Use a config file or `AUREL_API_KEY`.
 //!
 //! Commands:
 //!
 //! - `config show` — print the effective configuration and exit 0.
 //! - `config --help`, or bare `config` — print command help and exit 0.
+//! - `chat [MESSAGE]...` — send one message to the model and exit 0. With
+//!   no message words, the message is read from piped stdin instead (a
+//!   terminal with no message is a usage error). `chat --help` prints
+//!   command help. A `--` token inside the chat zone forces the rest to be
+//!   message words.
 //!
 //! Rules:
 //!
@@ -31,19 +42,21 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use aurel_config::LogLevel;
+use aurel_config::{parse_toggle, LogLevel};
 
 /// Which help text to print.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HelpTopic {
     Top,
     Config,
+    Chat,
 }
 
 /// Parsed subcommand.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     ConfigShow,
+    Chat { message: Vec<String> },
 }
 
 /// Successfully parsed command line.
@@ -53,6 +66,9 @@ pub struct Parsed {
     pub help: Option<HelpTopic>,
     pub log_level: Option<LogLevel>,
     pub config_path: Option<PathBuf>,
+    pub model_name: Option<String>,
+    pub base_url: Option<String>,
+    pub streaming: Option<bool>,
     pub command: Option<Command>,
 }
 
@@ -60,10 +76,18 @@ pub struct Parsed {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
     UnknownFlag(String),
-    MissingValue { flag: &'static str },
-    InvalidValue { flag: &'static str, value: String },
+    MissingValue {
+        flag: &'static str,
+    },
+    InvalidValue {
+        flag: &'static str,
+        value: String,
+        expected: &'static str,
+    },
     UnknownCommand(String),
-    UnexpectedCommandArgument { arg: String },
+    UnexpectedCommandArgument {
+        arg: String,
+    },
     VersionWithCommand,
 }
 
@@ -74,13 +98,19 @@ impl fmt::Display for ParseError {
             ParseError::MissingValue { flag } => {
                 write!(f, "error: flag '{flag}' requires a value")
             }
-            ParseError::InvalidValue { flag, value } => write!(
+            ParseError::InvalidValue {
+                flag,
+                value,
+                expected,
+            } => write!(
                 f,
-                "error: invalid value '{value}' for '{flag}': expected one of: \
-                 error, warn, info, debug, trace"
+                "error: invalid value '{value}' for '{flag}': expected {expected}"
             ),
             ParseError::UnknownCommand(cmd) => {
-                write!(f, "error: unknown command '{cmd}' (expected 'config')")
+                write!(
+                    f,
+                    "error: unknown command '{cmd}' (expected one of: config, chat)"
+                )
             }
             ParseError::UnexpectedCommandArgument { arg } => write!(
                 f,
@@ -103,12 +133,19 @@ fn split_long(token: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// Which command word opened the command zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandWord {
+    Config,
+    Chat,
+}
+
 /// Parse already-normalized (lossy `OsString`) arguments, excluding argv[0].
 pub fn parse(args: &[String]) -> Result<Parsed, ParseError> {
     let mut out = Parsed::default();
     let mut iter = args.iter().peekable();
     let mut in_command = false;
-    let mut command_seen = false;
+    let mut command_word: Option<CommandWord> = None;
     let mut flags_done = false;
 
     while let Some(token) = iter.next() {
@@ -151,6 +188,44 @@ pub fn parse(args: &[String]) -> Result<Parsed, ParseError> {
                             Some(value.parse().map_err(|_| ParseError::InvalidValue {
                                 flag: "--log-level",
                                 value,
+                                expected: "one of: error, warn, info, debug, trace",
+                            })?);
+                        continue;
+                    }
+                    "--model" => {
+                        let value = match inline {
+                            Some(v) => v.to_string(),
+                            None => iter
+                                .next()
+                                .cloned()
+                                .ok_or(ParseError::MissingValue { flag: "--model" })?,
+                        };
+                        out.model_name = Some(value);
+                        continue;
+                    }
+                    "--base-url" => {
+                        let value = match inline {
+                            Some(v) => v.to_string(),
+                            None => iter
+                                .next()
+                                .cloned()
+                                .ok_or(ParseError::MissingValue { flag: "--base-url" })?,
+                        };
+                        out.base_url = Some(value);
+                        continue;
+                    }
+                    "--streaming" => {
+                        let value = match inline {
+                            Some(v) => v.to_string(),
+                            None => iter.next().cloned().ok_or(ParseError::MissingValue {
+                                flag: "--streaming",
+                            })?,
+                        };
+                        out.streaming =
+                            Some(parse_toggle(&value).map_err(|_| ParseError::InvalidValue {
+                                flag: "--streaming",
+                                value,
+                                expected: "true or false",
                             })?);
                         continue;
                     }
@@ -161,15 +236,22 @@ pub fn parse(args: &[String]) -> Result<Parsed, ParseError> {
             in_command = true;
         }
 
-        // Command zone.
-        if !command_seen {
-            command_seen = true;
-            match token.as_str() {
-                "config" => continue,
-                other => return Err(ParseError::UnknownCommand(other.to_string())),
+        // Command zone: `config` takes a fixed subcommand, `chat` takes
+        // free-form message words.
+        match command_word {
+            None => {
+                command_word = Some(match token.as_str() {
+                    "config" => CommandWord::Config,
+                    "chat" => {
+                        out.command = Some(Command::Chat {
+                            message: Vec::new(),
+                        });
+                        CommandWord::Chat
+                    }
+                    other => return Err(ParseError::UnknownCommand(other.to_string())),
+                });
             }
-        } else {
-            match token.as_str() {
+            Some(CommandWord::Config) => match token.as_str() {
                 "show" => {
                     if out.command.is_some() {
                         return Err(ParseError::UnexpectedCommandArgument { arg: token.clone() });
@@ -182,16 +264,36 @@ pub fn parse(args: &[String]) -> Result<Parsed, ParseError> {
                 _ => {
                     return Err(ParseError::UnexpectedCommandArgument { arg: token.clone() });
                 }
-            }
+            },
+            Some(CommandWord::Chat) => match &mut out.command {
+                Some(Command::Chat { message }) => match token.as_str() {
+                    "-h" | "--help" => {
+                        out.command = None;
+                        out.help = Some(HelpTopic::Chat);
+                    }
+                    "--" => {
+                        // Everything after is message, even flag-shaped words.
+                        message.extend(iter.map(Clone::clone));
+                        break;
+                    }
+                    _ => message.push(token.clone()),
+                },
+                // Help was selected mid-command (`chat --help`): anything
+                // further is a usage error.
+                _ => {
+                    return Err(ParseError::UnexpectedCommandArgument { arg: token.clone() });
+                }
+            },
         }
     }
 
-    if out.version && command_seen {
+    if out.version && command_word.is_some() {
         return Err(ParseError::VersionWithCommand);
     }
     // Bare `config` (no subcommand, no explicit help) prints the command
-    // help, consistent with `config --help`.
-    if command_seen && out.command.is_none() && out.help.is_none() {
+    // help, consistent with `config --help`. (`chat` with no message words
+    // is meaningful: the message comes from stdin.)
+    if command_word == Some(CommandWord::Config) && out.command.is_none() && out.help.is_none() {
         out.help = Some(HelpTopic::Config);
     }
     Ok(out)
@@ -298,5 +400,76 @@ mod tests {
     fn dashdash_end_flags_then_command() {
         let parsed = parse(&args(&["--", "config", "show"])).expect("--");
         assert_eq!(parsed.command, Some(Command::ConfigShow));
+    }
+
+    #[test]
+    fn chat_collects_message_words() {
+        let parsed = parse(&args(&["chat", "hello", "world"])).expect("chat");
+        assert_eq!(
+            parsed.command,
+            Some(Command::Chat {
+                message: vec!["hello".to_string(), "world".to_string()]
+            })
+        );
+    }
+
+    #[test]
+    fn chat_without_words_is_valid_for_stdin() {
+        let parsed = parse(&args(&["chat"])).expect("bare chat");
+        assert_eq!(parsed.command, Some(Command::Chat { message: vec![] }));
+        assert_eq!(parsed.help, None);
+    }
+
+    #[test]
+    fn chat_help_selects_chat_topic() {
+        let parsed = parse(&args(&["chat", "--help"])).expect("chat help");
+        assert_eq!(parsed.help, Some(HelpTopic::Chat));
+        assert_eq!(parsed.command, None);
+    }
+
+    #[test]
+    fn chat_dashdash_forces_message_words() {
+        let parsed = parse(&args(&["chat", "--", "--help", "--model"])).expect("chat --");
+        assert_eq!(
+            parsed.command,
+            Some(Command::Chat {
+                message: vec!["--help".to_string(), "--model".to_string()]
+            })
+        );
+        assert_eq!(parsed.help, None);
+    }
+
+    #[test]
+    fn model_flags_parse() {
+        let parsed = parse(&args(&[
+            "--model",
+            "m",
+            "--base-url=http://x:1",
+            "--streaming",
+            "false",
+            "chat",
+            "hi",
+        ]))
+        .expect("model flags");
+        assert_eq!(parsed.model_name, Some("m".to_string()));
+        assert_eq!(parsed.base_url, Some("http://x:1".to_string()));
+        assert_eq!(parsed.streaming, Some(false));
+        assert!(matches!(parsed.command, Some(Command::Chat { .. })));
+    }
+
+    #[test]
+    fn invalid_model_flags_are_usage_errors() {
+        assert!(matches!(
+            parse(&args(&["--model"])),
+            Err(ParseError::MissingValue { .. })
+        ));
+        assert!(matches!(
+            parse(&args(&["--streaming", "maybe"])),
+            Err(ParseError::InvalidValue { .. })
+        ));
+        assert!(matches!(
+            parse(&args(&["--version", "chat", "hi"])),
+            Err(ParseError::VersionWithCommand)
+        ));
     }
 }

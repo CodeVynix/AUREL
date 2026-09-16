@@ -606,13 +606,13 @@ fn drive_stream(
     on_event: &mut dyn FnMut(StreamEvent) -> StreamControl,
     configured_model: &str,
 ) -> Result<ChatResponse, ProviderError> {
-    let mut lines = std::io::BufReader::new(reader).lines();
+    let lines = std::io::BufReader::new(reader).lines();
     let mut content = String::new();
     let mut finish_reason = None;
     let mut usage = None;
     let mut done = false;
 
-    while let Some(line) = lines.next() {
+    for line in lines {
         check_cancelled(request)?;
         let line = line.map_err(|e| ProviderError::StreamError(clip(&e.to_string())))?;
         if line.len() > MAX_SSE_LINE {

@@ -33,12 +33,16 @@ mod args;
 
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::io::Write;
+use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use args::{Command, HelpTopic};
 use aurel_config::{
     collect_aurel_env, discover_project_file, global_config_file, load, render_show, LoadRequest,
+};
+use aurel_model::{
+    ChatRequest, ModelProvider, OpenAiCompatible, OpenAiConfig, StreamControl, StreamEvent,
 };
 
 /// Exit code for CLI usage errors (unknown flags, bad commands/values).
@@ -87,10 +91,7 @@ impl Runtime {
 /// Render the top-level help text to `out`.
 fn print_help(out: &mut dyn Write) -> std::io::Result<()> {
     writeln!(out, "aurel {}", aurel_core::version())?;
-    writeln!(
-        out,
-        "Autonomous Utility & Reasoning Engine for Logic - Phase 1 CLI + config"
-    )?;
+    writeln!(out, "Autonomous Utility & Reasoning Engine for Logic")?;
     writeln!(out)?;
     writeln!(out, "USAGE:")?;
     writeln!(out, "    aurel [OPTIONS] [COMMAND]")?;
@@ -110,9 +111,20 @@ fn print_help(out: &mut dyn Write) -> std::io::Result<()> {
         out,
         "        --log-level <level> error|warn|info|debug|trace"
     )?;
+    writeln!(out, "        --model <name>      Model id for `chat`")?;
+    writeln!(out, "        --base-url <url>    Endpoint root for `chat`")?;
+    writeln!(out, "        --streaming <bool>  true|false (default true)")?;
     writeln!(out)?;
     writeln!(out, "COMMANDS:")?;
     writeln!(out, "    config show    Print the effective configuration")?;
+    writeln!(
+        out,
+        "    chat [MESSAGE] Send one message to the model and print"
+    )?;
+    writeln!(
+        out,
+        "                   the reply (reads piped stdin if omitted)"
+    )?;
     writeln!(out)?;
     writeln!(out, "CONFIG FILES (TOML):")?;
     writeln!(out, "    global:  %APPDATA%\\aurel\\config.toml (Windows)")?;
@@ -152,6 +164,44 @@ fn print_version(out: &mut dyn Write) -> std::io::Result<()> {
     writeln!(out, "aurel {}", aurel_core::version())
 }
 
+/// Render the `chat` command help text to `out`.
+fn print_chat_help(out: &mut dyn Write) -> std::io::Result<()> {
+    writeln!(out, "aurel {}", aurel_core::version())?;
+    writeln!(out)?;
+    writeln!(out, "USAGE:")?;
+    writeln!(out, "    aurel [OPTIONS] chat [MESSAGE]...")?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "Send one message to the configured model and print the reply."
+    )?;
+    writeln!(
+        out,
+        "With no MESSAGE words, the message is read from piped stdin;"
+    )?;
+    writeln!(out, "a terminal with no message is a usage error.")?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "This is a single request/response exchange, not an agent:"
+    )?;
+    writeln!(
+        out,
+        "it never inspects repositories, edits files, or runs commands."
+    )?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "Configure via [model] settings, AUREL_* env, or --model /"
+    )?;
+    writeln!(
+        out,
+        "--base-url / --streaming. There is no --api-key flag: use"
+    )?;
+    writeln!(out, "a config file or AUREL_API_KEY.")?;
+    Ok(())
+}
+
 /// Build the config [`LoadRequest`] for a parsed command line. An explicit
 /// `--config` path replaces global/project discovery (`project_searched` is
 /// then false, rendering "not searched"); otherwise both are discovered
@@ -174,6 +224,9 @@ fn build_request(parsed: &args::Parsed, rt: &Runtime) -> LoadRequest {
         explicit_file,
         env: rt.env.clone(),
         cli_log_level: parsed.log_level,
+        cli_model_name: parsed.model_name.clone(),
+        cli_base_url: parsed.base_url.clone(),
+        cli_streaming: parsed.streaming,
     }
 }
 
@@ -181,17 +234,31 @@ fn build_request(parsed: &args::Parsed, rt: &Runtime) -> LoadRequest {
 ///
 /// `--help`/`--version`/bare invocations short-circuit before any runtime
 /// state (environment, config files) is touched, so they stay independent
-/// of configuration/environment failures. Returns a process exit code:
+/// of configuration/environment failures. `stdin` is only consumed on the
+/// `chat` path without message words. Returns a process exit code:
 /// `0` on success, `2` on usage error, `1` on configuration/runtime failure
 /// or output failure.
-fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    run_inner(args, out, err, None)
+fn run(
+    args: &[String],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    stdin: &mut dyn Read,
+    stdin_is_terminal: bool,
+) -> i32 {
+    run_inner(args, out, err, None, stdin, stdin_is_terminal)
 }
 
 /// [`run`] with an injected [`Runtime`] for tests.
 #[cfg(test)]
-fn run_with(args: &[String], out: &mut dyn Write, err: &mut dyn Write, rt: &Runtime) -> i32 {
-    run_inner(args, out, err, Some(rt))
+fn run_with(
+    args: &[String],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    rt: &Runtime,
+    stdin: &mut dyn Read,
+    stdin_is_terminal: bool,
+) -> i32 {
+    run_inner(args, out, err, Some(rt), stdin, stdin_is_terminal)
 }
 
 fn run_inner(
@@ -199,6 +266,8 @@ fn run_inner(
     out: &mut dyn Write,
     err: &mut dyn Write,
     rt: Option<&Runtime>,
+    stdin: &mut dyn Read,
+    stdin_is_terminal: bool,
 ) -> i32 {
     let parsed = match args::parse(args) {
         Ok(parsed) => parsed,
@@ -213,6 +282,7 @@ fn run_inner(
         let ok = match topic {
             HelpTopic::Top => print_help(out),
             HelpTopic::Config => print_config_help(out),
+            HelpTopic::Chat => print_chat_help(out),
         };
         return if ok.is_ok() { 0 } else { 1 };
     }
@@ -220,7 +290,7 @@ fn run_inner(
         return if print_version(out).is_ok() { 0 } else { 1 };
     }
 
-    match parsed.command {
+    match parsed.command.as_ref() {
         // Bare invocation: help, without touching config files.
         None => {
             if print_help(out).is_ok() {
@@ -229,7 +299,7 @@ fn run_inner(
                 1
             }
         }
-        // Command path: only here is the live runtime constructed.
+        // Command paths: only here is the live runtime constructed.
         Some(Command::ConfigShow) => match rt {
             Some(injected) => execute_config_show(&parsed, out, err, injected),
             None => {
@@ -237,6 +307,23 @@ fn run_inner(
                 execute_config_show(&parsed, out, err, &live)
             }
         },
+        Some(Command::Chat { message }) => {
+            let text = match resolve_message(message, stdin, stdin_is_terminal) {
+                Ok(text) => text,
+                Err(e) => {
+                    let _ = writeln!(err, "{e}");
+                    let _ = writeln!(err, "tip: run 'aurel chat --help' for usage.");
+                    return EXIT_USAGE_ERROR;
+                }
+            };
+            match rt {
+                Some(injected) => execute_chat(&parsed, &text, out, err, injected),
+                None => {
+                    let live = Runtime::live();
+                    execute_chat(&parsed, &text, out, err, &live)
+                }
+            }
+        }
     }
 }
 
@@ -261,16 +348,158 @@ fn execute_config_show(
     }
 }
 
+/// Why no chat message is available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageError {
+    /// Nothing on argv and (terminal with no pipe, or empty pipe).
+    NoMessage,
+    /// Piped stdin could not be read at all.
+    UnreadableStdin,
+}
+
+impl std::fmt::Display for MessageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MessageError::NoMessage => write!(
+                f,
+                "error: no message given (pass MESSAGE arguments or pipe one via stdin)"
+            ),
+            MessageError::UnreadableStdin => write!(f, "error: could not read message from stdin"),
+        }
+    }
+}
+
+/// Resolve the chat message: argv words joined with spaces, else piped
+/// stdin (trimmed). A terminal with no words is a usage error rather than
+/// a blocking read. Pure over injected stdin, so unit-testable.
+fn resolve_message(
+    words: &[String],
+    stdin: &mut dyn Read,
+    stdin_is_terminal: bool,
+) -> Result<String, MessageError> {
+    if !words.is_empty() {
+        let text = words.join(" ");
+        return if text.trim().is_empty() {
+            Err(MessageError::NoMessage)
+        } else {
+            Ok(text)
+        };
+    }
+    if stdin_is_terminal {
+        return Err(MessageError::NoMessage);
+    }
+    let mut buf = String::new();
+    stdin
+        .read_to_string(&mut buf)
+        .map_err(|_| MessageError::UnreadableStdin)?;
+    let text = buf.trim().to_string();
+    if text.is_empty() {
+        Err(MessageError::NoMessage)
+    } else {
+        Ok(text)
+    }
+}
+
+/// Build the provider from resolved `[model]` settings. Validation failures
+/// (empty model, bad URL, unbounded timeout) surface as clean exit-1 errors.
+fn build_provider(
+    cfg: &aurel_config::EffectiveConfig,
+) -> Result<OpenAiCompatible, aurel_model::ProviderError> {
+    OpenAiCompatible::new(OpenAiConfig {
+        base_url: cfg.model.base_url.clone(),
+        model: cfg.model.name.clone(),
+        api_key: cfg.model.api_key.clone(),
+        timeout: Duration::from_secs(cfg.model.timeout_secs),
+        max_retries: cfg.model.max_retries,
+    })
+}
+
+/// One request/response exchange against any provider. Streaming deltas
+/// print progressively; the full reply (or the error) determines the exit
+/// code. Provider errors print their own clean messages — never secrets.
+fn chat_with_provider(
+    message: &str,
+    streaming: bool,
+    provider: &dyn ModelProvider,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    let request = ChatRequest::one_shot(message, streaming);
+    if streaming {
+        let mut write_failed = false;
+        let result = provider.chat_stream(&request, &mut |event: StreamEvent| {
+            if !write_failed && (write!(out, "{}", event.delta).is_err() || out.flush().is_err()) {
+                write_failed = true;
+            }
+            StreamControl::Continue
+        });
+        match result {
+            Ok(_) => {
+                let _ = writeln!(out);
+                if write_failed {
+                    1
+                } else {
+                    0
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(err, "{e}");
+                EXIT_RUNTIME_ERROR
+            }
+        }
+    } else {
+        match provider.chat(&request) {
+            Ok(response) => {
+                if writeln!(out, "{}", response.content).is_ok() {
+                    0
+                } else {
+                    1
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(err, "{e}");
+                EXIT_RUNTIME_ERROR
+            }
+        }
+    }
+}
+
+fn execute_chat(
+    parsed: &args::Parsed,
+    message: &str,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    rt: &Runtime,
+) -> i32 {
+    let cfg = match load(&build_request(parsed, rt)) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            let _ = writeln!(err, "{e}");
+            return EXIT_RUNTIME_ERROR;
+        }
+    };
+    let provider = match build_provider(&cfg) {
+        Ok(provider) => provider,
+        Err(e) => {
+            let _ = writeln!(err, "{e}");
+            return EXIT_RUNTIME_ERROR;
+        }
+    };
+    chat_with_provider(message, cfg.model.streaming, &provider, out, err)
+}
+
 fn main() {
     let raw: Vec<OsString> = std::env::args_os().skip(1).collect();
     let args = normalize_args(&raw);
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
+    let stdin = std::io::stdin();
     let mut out = stdout.lock();
     let mut err = stderr.lock();
+    let mut input = stdin.lock();
     // Note: the live Runtime is constructed lazily inside `run`, only on the
     // command path — help/version/bare never touch environment or config.
-    let code = run(&args, &mut out, &mut err);
+    let code = run(&args, &mut out, &mut err, &mut input, stdin.is_terminal());
     // Ensure buffered output is flushed before exiting with a code.
     let _ = out.flush();
     let _ = err.flush();
@@ -291,10 +520,19 @@ mod tests {
     }
 
     fn run_to_string(args: &[&str], rt: &Runtime) -> (i32, String, String) {
+        run_to_string_with_stdin(args, rt, &mut &b""[..], false)
+    }
+
+    fn run_to_string_with_stdin(
+        args: &[&str],
+        rt: &Runtime,
+        stdin: &mut dyn Read,
+        stdin_is_terminal: bool,
+    ) -> (i32, String, String) {
         let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_with(&owned, &mut out, &mut err, rt);
+        let code = run_with(&owned, &mut out, &mut err, rt, stdin, stdin_is_terminal);
         (
             code,
             String::from_utf8(out).expect("stdout must be UTF-8"),
@@ -469,10 +707,168 @@ mod tests {
         let rt = test_runtime();
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_with(&args, &mut out, &mut err, &rt);
+        let code = run_with(&args, &mut out, &mut err, &rt, &mut &b""[..], false);
         // Lossy output matches no known flag or command, so it is a usage
         // error — reaching this assertion proves no panic occurred.
         assert_eq!(code, EXIT_USAGE_ERROR);
+    }
+
+    #[test]
+    fn resolve_message_prefers_argv_then_pipe() {
+        let words = vec!["hello".to_string(), "world".to_string()];
+        assert_eq!(
+            resolve_message(&words, &mut &b"ignored"[..], false),
+            Ok("hello world".to_string())
+        );
+        // Piped stdin, trimmed.
+        assert_eq!(
+            resolve_message(&[], &mut &b"  piped\n"[..], false),
+            Ok("piped".to_string())
+        );
+        // Terminal with no words: usage error, never a blocking read.
+        assert_eq!(
+            resolve_message(&[], &mut &b"would-block"[..], true),
+            Err(MessageError::NoMessage)
+        );
+        // Empty pipe: usage error.
+        assert_eq!(
+            resolve_message(&[], &mut &b"  \n"[..], false),
+            Err(MessageError::NoMessage)
+        );
+        // Empty argv word: usage error.
+        assert_eq!(
+            resolve_message(&["  ".to_string()], &mut &b""[..], false),
+            Err(MessageError::NoMessage)
+        );
+    }
+
+    /// Test double for [`chat_with_provider`]: canned outcome, optional
+    /// progressive delivery, event counting.
+    struct FakeProvider {
+        response: Result<aurel_model::ChatResponse, aurel_model::ProviderError>,
+        streaming: bool,
+        events_seen: std::cell::Cell<usize>,
+    }
+
+    impl ModelProvider for FakeProvider {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn capabilities(&self) -> aurel_model::Capabilities {
+            aurel_model::Capabilities {
+                streaming: self.streaming,
+                tool_calling: false,
+                structured_output: false,
+                context_window: None,
+            }
+        }
+
+        fn chat(
+            &self,
+            _request: &aurel_model::ChatRequest,
+        ) -> Result<aurel_model::ChatResponse, aurel_model::ProviderError> {
+            self.response.clone()
+        }
+
+        fn chat_stream(
+            &self,
+            request: &aurel_model::ChatRequest,
+            on_event: &mut dyn FnMut(aurel_model::StreamEvent) -> aurel_model::StreamControl,
+        ) -> Result<aurel_model::ChatResponse, aurel_model::ProviderError> {
+            if request.stream && self.streaming {
+                for delta in ["Hel", "lo"] {
+                    self.events_seen.set(self.events_seen.get() + 1);
+                    on_event(aurel_model::StreamEvent {
+                        delta: delta.to_string(),
+                    });
+                }
+            }
+            self.response.clone()
+        }
+    }
+
+    fn fake_response() -> aurel_model::ChatResponse {
+        aurel_model::ChatResponse {
+            content: "fake reply".to_string(),
+            role: aurel_model::Role::Assistant,
+            model: "fake-model".to_string(),
+            finish_reason: Some(aurel_model::FinishReason::Stop),
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn chat_prints_full_reply_without_streaming() {
+        let provider = FakeProvider {
+            response: Ok(fake_response()),
+            streaming: false,
+            events_seen: std::cell::Cell::new(0),
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = chat_with_provider("hi", false, &provider, &mut out, &mut err);
+        assert_eq!(code, 0);
+        assert_eq!(String::from_utf8(out).expect("utf8"), "fake reply\n");
+        assert_eq!(provider.events_seen.get(), 0);
+    }
+
+    #[test]
+    fn chat_streams_progressively() {
+        let provider = FakeProvider {
+            response: Ok(fake_response()),
+            streaming: true,
+            events_seen: std::cell::Cell::new(0),
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = chat_with_provider("hi", true, &provider, &mut out, &mut err);
+        assert_eq!(code, 0);
+        assert_eq!(String::from_utf8(out).expect("utf8"), "Hello\n");
+        assert_eq!(provider.events_seen.get(), 2);
+    }
+
+    #[test]
+    fn chat_provider_failure_reports_exit_1_without_secrets() {
+        let provider = FakeProvider {
+            response: Err(aurel_model::ProviderError::Authentication(
+                "endpoint rejected the credentials; set [model] api_key or AUREL_API_KEY".into(),
+            )),
+            streaming: true,
+            events_seen: std::cell::Cell::new(0),
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = chat_with_provider("hi", true, &provider, &mut out, &mut err);
+        assert_eq!(code, EXIT_RUNTIME_ERROR);
+        let err = String::from_utf8(err).expect("utf8");
+        assert!(err.contains("rejected the credentials"), "got: {err:?}");
+    }
+
+    #[test]
+    fn chat_without_message_or_pipe_is_exit_2() {
+        let rt = test_runtime();
+        // Empty pipe: usage error, no network touched.
+        let (code, _out, err) = run_to_string_with_stdin(&["chat"], &rt, &mut &b""[..], false);
+        assert_eq!(code, EXIT_USAGE_ERROR);
+        assert!(err.contains("no message"), "got: {err:?}");
+    }
+
+    #[test]
+    fn chat_build_failure_is_exit_1_without_network() {
+        // timeout_secs 0 fails provider construction before any I/O.
+        let rt = Runtime {
+            cwd: test_runtime().cwd,
+            appdata: None,
+            home: None,
+            env: [("AUREL_TIMEOUT_SECS".to_string(), "0".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let (code, _out, err) =
+            run_to_string_with_stdin(&["chat", "hi"], &rt, &mut &b""[..], false);
+        assert_eq!(code, EXIT_RUNTIME_ERROR);
+        assert!(err.contains("timeout"), "got: {err:?}");
     }
 
     /// Non-Unicode OS input for the current platform (bytes that are invalid

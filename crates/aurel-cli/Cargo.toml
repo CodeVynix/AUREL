@@ -13,3 +13,4 @@ path = "src/main.rs"
 [dependencies]
 aurel-core = { path = "../aurel-core" }
 aurel-config = { path = "../aurel-config" }
+aurel-model = { path = "../aurel-model" }
