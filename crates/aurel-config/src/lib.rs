@@ -34,6 +34,19 @@ use serde::{Deserialize, Deserializer};
 
 /// Environment variable overriding `log_level`.
 pub const ENV_LOG_LEVEL: &str = "AUREL_LOG_LEVEL";
+/// Environment variable overriding `[model] name`.
+pub const ENV_MODEL: &str = "AUREL_MODEL";
+/// Environment variable overriding `[model] base_url`.
+pub const ENV_BASE_URL: &str = "AUREL_BASE_URL";
+/// Environment variable providing the model API key. Never logged, never
+/// shown: [`render_show`] prints `<redacted>` instead of the value.
+pub const ENV_API_KEY: &str = "AUREL_API_KEY";
+/// Environment variable overriding `[model] timeout_secs`.
+pub const ENV_TIMEOUT_SECS: &str = "AUREL_TIMEOUT_SECS";
+/// Environment variable overriding `[model] max_retries`.
+pub const ENV_MAX_RETRIES: &str = "AUREL_MAX_RETRIES";
+/// Environment variable overriding `[model] streaming` (`true`/`false`).
+pub const ENV_STREAMING: &str = "AUREL_STREAMING";
 
 /// Log verbosity. Spelled lowercase in every source; parsing is
 /// case-insensitive.
@@ -107,6 +120,90 @@ impl<'de> Deserialize<'de> for LogLevel {
     }
 }
 
+/// Strict boolean spelling shared by env and CLI toggles.
+pub fn parse_toggle(text: &str) -> Result<bool, ToggleParseError> {
+    match text.to_ascii_lowercase().as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(ToggleParseError),
+    }
+}
+
+/// Rejection of a non-`true`/`false` toggle spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToggleParseError;
+
+impl fmt::Display for ToggleParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("expected true or false")
+    }
+}
+
+impl std::error::Error for ToggleParseError {}
+
+/// Model endpoint settings (`[model]`). Resolved through the same
+/// defaults < file < env < CLI precedence as everything else.
+///
+/// The API key is optional (local servers often need none) and is treated
+/// as a secret everywhere: redacted in [`render_show`], redacted in
+/// [`fmt::Debug`], never part of any [`ConfigError`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct ModelSettings {
+    pub name: String,
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub timeout_secs: u64,
+    pub max_retries: u32,
+    pub streaming: bool,
+}
+
+impl Default for ModelSettings {
+    fn default() -> Self {
+        ModelSettings {
+            // Local-first placeholder: a common local-server root. The user
+            // overrides it; nothing here names a commercial provider.
+            name: "default".to_string(),
+            base_url: "http://127.0.0.1:11434/v1".to_string(),
+            api_key: None,
+            timeout_secs: 60,
+            max_retries: 1,
+            streaming: true,
+        }
+    }
+}
+
+impl fmt::Debug for ModelSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ModelSettings")
+            .field("name", &self.name)
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("timeout_secs", &self.timeout_secs)
+            .field("max_retries", &self.max_retries)
+            .field("streaming", &self.streaming)
+            .finish()
+    }
+}
+
+/// Partial `[model]` table as read from a single TOML file. Every field is
+/// optional; unknown fields are rejected.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelFileConfig {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    #[serde(default)]
+    max_retries: Option<u32>,
+    #[serde(default)]
+    streaming: Option<bool>,
+}
+
 /// Partial configuration as read from a single TOML file.
 ///
 /// Every field is optional; a file may set any subset. Unknown fields are
@@ -115,12 +212,16 @@ impl<'de> Deserialize<'de> for LogLevel {
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     log_level: Option<LogLevel>,
+    #[serde(default)]
+    model: Option<ModelFileConfig>,
 }
 
 /// Fully resolved configuration plus where each file layer came from.
+/// `Debug` is safe to print: [`ModelSettings`] redacts the API key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveConfig {
     pub log_level: LogLevel,
+    pub model: ModelSettings,
     /// Discovered global file path, if the home location was resolvable.
     pub global_file: Option<PathBuf>,
     /// Whether the global file existed and was applied.
@@ -141,7 +242,10 @@ pub struct EffectiveConfig {
 
 /// Everything [`load`] needs, with environment and filesystem inputs passed
 /// as plain values so tests can inject fakes.
-#[derive(Debug, Default)]
+///
+/// `Debug` is safe to print: the one secret-bearing variable
+/// (`AUREL_API_KEY`) redacts itself.
+#[derive(Default)]
 pub struct LoadRequest {
     /// Global file to read, if any. `None` skips the layer.
     pub global_file: Option<PathBuf>,
@@ -158,6 +262,36 @@ pub struct LoadRequest {
     pub env: HashMap<String, String>,
     /// `--log-level` override. `None` means not given.
     pub cli_log_level: Option<LogLevel>,
+    /// `--model` override. `None` means not given.
+    pub cli_model_name: Option<String>,
+    /// `--base-url` override. `None` means not given.
+    pub cli_base_url: Option<String>,
+    /// `--streaming` override. `None` means not given.
+    pub cli_streaming: Option<bool>,
+}
+
+impl fmt::Debug for LoadRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let env: HashMap<&String, &str> = self
+            .env
+            .iter()
+            .map(|(k, v)| {
+                let shown = if k == ENV_API_KEY { "<redacted>" } else { v };
+                (k, shown)
+            })
+            .collect();
+        f.debug_struct("LoadRequest")
+            .field("global_file", &self.global_file)
+            .field("project_file", &self.project_file)
+            .field("project_searched", &self.project_searched)
+            .field("explicit_file", &self.explicit_file)
+            .field("env", &env)
+            .field("cli_log_level", &self.cli_log_level)
+            .field("cli_model_name", &self.cli_model_name)
+            .field("cli_base_url", &self.cli_base_url)
+            .field("cli_streaming", &self.cli_streaming)
+            .finish()
+    }
 }
 
 /// Configuration failure. Every variant carries the context needed for a
@@ -247,32 +381,27 @@ fn parse_file(path: &Path, text: &str) -> Result<FileConfig, ConfigError> {
 /// precedence: defaults < global < project < explicit < env < CLI.
 pub fn load(req: &LoadRequest) -> Result<EffectiveConfig, ConfigError> {
     let mut log_level = LogLevel::default();
+    let mut model = ModelSettings::default();
     let mut global_found = false;
     let mut project_found = false;
 
     if let Some(path) = &req.global_file {
         if let Some(file) = read_optional_file(path)? {
-            if let Some(level) = file.log_level {
-                log_level = level;
-            }
+            apply_file(&file, &mut log_level, &mut model);
             global_found = true;
         }
     }
 
     if let Some(path) = &req.project_file {
         if let Some(file) = read_optional_file(path)? {
-            if let Some(level) = file.log_level {
-                log_level = level;
-            }
+            apply_file(&file, &mut log_level, &mut model);
             project_found = true;
         }
     }
 
     if let Some(path) = &req.explicit_file {
         let file = read_required_file(path)?;
-        if let Some(level) = file.log_level {
-            log_level = level;
-        }
+        apply_file(&file, &mut log_level, &mut model);
     }
 
     if let Some(value) = req.env.get(ENV_LOG_LEVEL) {
@@ -284,13 +413,24 @@ pub fn load(req: &LoadRequest) -> Result<EffectiveConfig, ConfigError> {
                 message: e.to_string(),
             })?;
     }
+    apply_model_env(&req.env, &mut model)?;
 
     if let Some(level) = req.cli_log_level {
         log_level = level;
     }
+    if let Some(name) = &req.cli_model_name {
+        model.name = name.clone();
+    }
+    if let Some(url) = &req.cli_base_url {
+        model.base_url = url.clone();
+    }
+    if let Some(streaming) = req.cli_streaming {
+        model.streaming = streaming;
+    }
 
     Ok(EffectiveConfig {
         log_level,
+        model,
         global_file: req.global_file.clone(),
         global_found,
         project_file: req.project_file.clone(),
@@ -298,6 +438,72 @@ pub fn load(req: &LoadRequest) -> Result<EffectiveConfig, ConfigError> {
         project_searched: req.project_searched,
         explicit_file: req.explicit_file.clone(),
     })
+}
+
+/// Overlay one file's values onto the running resolution.
+fn apply_file(file: &FileConfig, log_level: &mut LogLevel, model: &mut ModelSettings) {
+    if let Some(level) = file.log_level {
+        *log_level = level;
+    }
+    if let Some(table) = &file.model {
+        if let Some(name) = &table.name {
+            model.name = name.clone();
+        }
+        if let Some(url) = &table.base_url {
+            model.base_url = url.clone();
+        }
+        if let Some(key) = &table.api_key {
+            model.api_key = Some(key.clone());
+        }
+        if let Some(timeout) = table.timeout_secs {
+            model.timeout_secs = timeout;
+        }
+        if let Some(retries) = table.max_retries {
+            model.max_retries = retries;
+        }
+        if let Some(streaming) = table.streaming {
+            model.streaming = streaming;
+        }
+    }
+}
+
+/// Overlay `AUREL_*` model variables. The API key is a free-form string and
+/// therefore never fails validation — and so never appears in an error.
+fn apply_model_env(
+    env: &HashMap<String, String>,
+    model: &mut ModelSettings,
+) -> Result<(), ConfigError> {
+    if let Some(value) = env.get(ENV_MODEL) {
+        model.name = value.clone();
+    }
+    if let Some(value) = env.get(ENV_BASE_URL) {
+        model.base_url = value.clone();
+    }
+    if let Some(value) = env.get(ENV_API_KEY) {
+        model.api_key = Some(value.clone());
+    }
+    if let Some(value) = env.get(ENV_TIMEOUT_SECS) {
+        model.timeout_secs = value.parse().map_err(|_| ConfigError::InvalidEnv {
+            var: ENV_TIMEOUT_SECS.to_string(),
+            value: value.clone(),
+            message: "expected seconds as an unsigned integer".to_string(),
+        })?;
+    }
+    if let Some(value) = env.get(ENV_MAX_RETRIES) {
+        model.max_retries = value.parse().map_err(|_| ConfigError::InvalidEnv {
+            var: ENV_MAX_RETRIES.to_string(),
+            value: value.clone(),
+            message: "expected a retry count as an unsigned integer".to_string(),
+        })?;
+    }
+    if let Some(value) = env.get(ENV_STREAMING) {
+        model.streaming = parse_toggle(value).map_err(|e| ConfigError::InvalidEnv {
+            var: ENV_STREAMING.to_string(),
+            value: value.clone(),
+            message: e.to_string(),
+        })?;
+    }
+    Ok(())
 }
 
 /// Environment conversion policy: collect the `AUREL_*` subset of raw OS
@@ -370,8 +576,10 @@ pub fn discover_project_file(start: &Path) -> Option<PathBuf> {
 /// Render the effective configuration for `aurel config show`: `#` comment
 /// lines describing each file layer, then the settings as TOML.
 ///
-/// The value domain of every rendered field is a fixed lowercase word list,
-/// so the manual rendering cannot produce invalid quoting.
+/// The API key renders as `<redacted>` when set and `<unset>` otherwise —
+/// the real value is never printed. Free-form strings are TOML-escaped by
+/// [`toml_string`] (user input can contain quotes); fixed-domain fields
+/// render directly.
 pub fn render_show(cfg: &EffectiveConfig) -> String {
     let mut out = String::from("# aurel effective configuration (TOML)\n");
     out.push_str(&show_source_line(
@@ -384,6 +592,43 @@ pub fn render_show(cfg: &EffectiveConfig) -> String {
         out.push_str(&format!("# explicit: {}\n", path.display()));
     }
     out.push_str(&format!("log_level = \"{}\"\n", cfg.log_level.as_str()));
+    out.push_str("\n[model]\n");
+    out.push_str(&format!("name = {}\n", toml_string(&cfg.model.name)));
+    out.push_str(&format!(
+        "base_url = {}\n",
+        toml_string(&cfg.model.base_url)
+    ));
+    out.push_str(&format!(
+        "api_key = {}\n",
+        if cfg.model.api_key.is_some() {
+            "\"<redacted>\"".to_string()
+        } else {
+            "\"<unset>\"".to_string()
+        }
+    ));
+    out.push_str(&format!("timeout_secs = {}\n", cfg.model.timeout_secs));
+    out.push_str(&format!("max_retries = {}\n", cfg.model.max_retries));
+    out.push_str(&format!("streaming = {}\n", cfg.model.streaming));
+    out
+}
+
+/// Quote a free-form string as a TOML basic string. Display-only, but exact:
+/// every character that needs escaping is escaped.
+fn toml_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
     out
 }
 
@@ -588,6 +833,7 @@ mod tests {
     fn render_show_contains_settings_and_sources() {
         let cfg = EffectiveConfig {
             log_level: LogLevel::Debug,
+            model: ModelSettings::default(),
             global_file: Some(PathBuf::from("/g/config.toml")),
             global_found: false,
             project_file: Some(PathBuf::from("/p/.aurel/config.toml")),
@@ -606,6 +852,7 @@ mod tests {
         // Searched and empty: must not claim "not searched".
         let searched_empty = EffectiveConfig {
             log_level: LogLevel::Info,
+            model: ModelSettings::default(),
             global_file: Some(PathBuf::from("/g/config.toml")),
             global_found: false,
             project_file: None,
@@ -688,5 +935,146 @@ mod tests {
             };
             assert!(matches!(load(&req), Err(ConfigError::InvalidEnv { .. })));
         }
+    }
+
+    #[test]
+    fn model_defaults_apply() {
+        let cfg = load(&request()).expect("load defaults");
+        assert_eq!(cfg.model.name, "default");
+        assert_eq!(cfg.model.base_url, "http://127.0.0.1:11434/v1");
+        assert_eq!(cfg.model.api_key, None);
+        assert_eq!(cfg.model.timeout_secs, 60);
+        assert_eq!(cfg.model.max_retries, 1);
+        assert!(cfg.model.streaming);
+    }
+
+    #[test]
+    fn model_precedence_is_file_env_cli() {
+        let dir = test_dir("model-precedence");
+        let project = dir.join("project.toml");
+        write(
+            &project,
+            "[model]\nname = \"file-model\"\nbase_url = \"http://file:1\"\n\
+             timeout_secs = 10\nmax_retries = 0\nstreaming = false\n\
+             api_key = \"file-key\"\n",
+        );
+        let mut req = request();
+        req.project_file = Some(project);
+        req.project_searched = true;
+
+        let cfg = load(&req).expect("file");
+        assert_eq!(cfg.model.name, "file-model");
+        assert_eq!(cfg.model.api_key, Some("file-key".to_string()));
+        assert!(!cfg.model.streaming);
+
+        req.env.insert(ENV_MODEL.into(), "env-model".into());
+        req.env.insert(ENV_API_KEY.into(), "env-key".into());
+        req.env.insert(ENV_STREAMING.into(), "true".into());
+        let cfg = load(&req).expect("env");
+        assert_eq!(cfg.model.name, "env-model");
+        assert_eq!(cfg.model.api_key, Some("env-key".to_string()));
+        assert!(cfg.model.streaming);
+
+        req.cli_model_name = Some("cli-model".into());
+        req.cli_base_url = Some("http://cli:2".into());
+        req.cli_streaming = Some(false);
+        let cfg = load(&req).expect("cli");
+        assert_eq!(cfg.model.name, "cli-model");
+        assert_eq!(cfg.model.base_url, "http://cli:2");
+        assert!(!cfg.model.streaming);
+        // CLI has no key flag (history-safe): the env key survives.
+        assert_eq!(cfg.model.api_key, Some("env-key".to_string()));
+    }
+
+    #[test]
+    fn invalid_model_env_values_name_their_variable() {
+        for (var, value) in [
+            (ENV_TIMEOUT_SECS, "soon"),
+            (ENV_MAX_RETRIES, "many"),
+            (ENV_STREAMING, "maybe"),
+        ] {
+            let mut req = request();
+            req.env.insert(var.into(), value.into());
+            let err = load(&req).expect_err("must fail");
+            assert!(matches!(err, ConfigError::InvalidEnv { .. }), "{err:?}");
+            assert!(err.to_string().contains(var), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_model_field_is_rejected() {
+        let dir = test_dir("model-unknown-field");
+        let path = dir.join("typo.toml");
+        write(&path, "[model]\nmodel_name = \"x\"\n");
+        let mut req = request();
+        req.project_file = Some(path);
+        assert!(
+            matches!(load(&req), Err(ConfigError::MalformedFile { .. })),
+            "typo'd model keys must not be silently ignored"
+        );
+    }
+
+    #[test]
+    fn show_redacts_the_api_key() {
+        let dir = test_dir("redaction");
+        let path = dir.join("secret.toml");
+        write(&path, "[model]\napi_key = \"sk-live-EXAMPLE-12345\"\n");
+        let mut req = request();
+        req.project_file = Some(path);
+        let cfg = load(&req).expect("load");
+        let text = render_show(&cfg);
+        assert!(text.contains("api_key = \"<redacted>\""), "got: {text:?}");
+        assert!(
+            !text.contains("sk-live-EXAMPLE-12345"),
+            "key leaked: {text:?}"
+        );
+
+        let plain = load(&request()).expect("defaults");
+        let text = render_show(&plain);
+        assert!(text.contains("api_key = \"<unset>\""), "got: {text:?}");
+    }
+
+    #[test]
+    fn debug_formatting_never_shows_the_key() {
+        let mut req = request();
+        req.env
+            .insert(ENV_API_KEY.into(), "sk-live-EXAMPLE-999".into());
+        let cfg = load(&req).expect("load");
+        for shown in [
+            format!("{:?}", cfg),
+            format!("{:?}", cfg.model),
+            format!("{:?}", req),
+        ] {
+            assert!(!shown.contains("sk-live-EXAMPLE-999"), "leak: {shown:?}");
+            assert!(shown.contains("<redacted>"), "missing marker: {shown:?}");
+        }
+    }
+
+    #[test]
+    fn toggle_parsing_is_strict_but_case_insensitive() {
+        assert_eq!(parse_toggle("true"), Ok(true));
+        assert_eq!(parse_toggle("FALSE"), Ok(false));
+        assert!(parse_toggle("yes").is_err());
+        assert!(parse_toggle("1").is_err());
+    }
+
+    #[test]
+    fn show_escapes_freeform_values() {
+        let mut cfg = load(&request()).expect("defaults");
+        cfg.model.name = "weird \" \\ name".to_string();
+        let text = render_show(&cfg);
+        assert!(
+            text.contains("name = \"weird \\\" \\\\ name\""),
+            "got: {text:?}"
+        );
+        // Round-trips as valid TOML.
+        let reparsed: toml::Value = text
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .parse()
+            .expect("show output must stay valid TOML");
+        assert_eq!(reparsed["model"]["name"].as_str(), Some("weird \" \\ name"));
     }
 }
