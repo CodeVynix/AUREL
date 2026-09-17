@@ -1,7 +1,7 @@
 //! Provider-agnostic chat types. Plain data only — no HTTP, no JSON wire
-//! shapes. Providers translate between these and their API.
+//! shapes, no wire spellings. Providers translate between these and their
+//! API (role spellings included).
 
-use std::fmt;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -9,28 +9,14 @@ use std::sync::{
 
 /// Conversation role. Only `user` is produced by `aurel chat` today;
 /// `system` exists so future phases need no type change.
+///
+/// Deliberately no string spelling here: each provider maps roles to its
+/// own wire format at its boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     System,
     User,
     Assistant,
-}
-
-impl Role {
-    /// Wire spelling used by OpenAI-compatible APIs.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Role::System => "system",
-            Role::User => "user",
-            Role::Assistant => "assistant",
-        }
-    }
-}
-
-impl fmt::Display for Role {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
 }
 
 /// One conversation message.
@@ -182,13 +168,6 @@ pub enum StreamControl {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn role_spellings_match_openai_convention() {
-        assert_eq!(Role::System.as_str(), "system");
-        assert_eq!(Role::User.as_str(), "user");
-        assert_eq!(Role::Assistant.as_str(), "assistant");
-    }
 
     #[test]
     fn cancel_flag_round_trips() {

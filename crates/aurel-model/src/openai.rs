@@ -19,7 +19,6 @@
 //!   errors is clipped to [`MAX_DIAG_CHARS`].
 
 use std::fmt;
-use std::io::BufRead;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -120,6 +119,13 @@ impl OpenAiCompatible {
         self.config.max_retries.min(MAX_RETRIES)
     }
 
+    /// Scrub the configured credential out of server-controlled text before
+    /// it can reach any [`ProviderError`]. See [`scrub_opt`] for the exact
+    /// policy (order matters: replace before bounding).
+    fn scrub(&self, text: &str) -> String {
+        scrub_opt(text, self.config.api_key.as_deref())
+    }
+
     /// The request URL (no credentials — the key travels by header only).
     #[cfg(test)]
     fn endpoint(&self) -> &str {
@@ -163,7 +169,9 @@ impl OpenAiCompatible {
         call.send_json(body).map_err(map_transport_error)
     }
 
-    /// Run `op` with bounded retries for transient failures only.
+    /// Run `op` with bounded retries for transient failures only. Backoff
+    /// waits are cancellation-aware: the cancel flag is observed throughout
+    /// the wait, not just after it.
     fn with_retries<T>(
         &self,
         request: &ChatRequest,
@@ -176,10 +184,7 @@ impl OpenAiCompatible {
                 Ok(value) => return Ok(value),
                 Err(e) if e.retryable() && attempt < self.retries() => {
                     attempt += 1;
-                    let wait = RETRY_BASE
-                        .saturating_mul(attempt)
-                        .min(Duration::from_secs(5));
-                    std::thread::sleep(wait);
+                    cancellable_wait(request, retry_delay(attempt, retry_hint(&e)))?;
                 }
                 Err(e) => return Err(e),
             }
@@ -191,25 +196,75 @@ impl OpenAiCompatible {
         let status = response.status().as_u16();
         if status == 200 {
             let text = read_limited_body(response.body_mut(), MAX_JSON_BODY)?;
-            return parse_chat_body(&text, &self.config.model);
+            return parse_chat_body(&text, &self.config.model, self.config.api_key.as_deref());
         }
-        Err(status_error(&mut response, status))
+        Err(self.status_error(&mut response, status))
     }
 
     fn stream_once(
         &self,
         request: &ChatRequest,
         on_event: &mut dyn FnMut(StreamEvent) -> StreamControl,
-    ) -> Result<ChatResponse, ProviderError> {
-        check_cancelled(request)?;
-        let response = self.send(request, true)?;
+    ) -> AttemptOutcome {
+        if is_cancelled(request) {
+            return AttemptOutcome::FailedClean(ProviderError::Cancelled);
+        }
+        let response = match self.send(request, true) {
+            Ok(response) => response,
+            Err(error) => return AttemptOutcome::FailedClean(error),
+        };
         let status = response.status().as_u16();
         if status != 200 {
             let mut response = response;
-            return Err(status_error(&mut response, status));
+            return AttemptOutcome::FailedClean(self.status_error(&mut response, status));
         }
-        let reader = response.into_body().into_reader();
-        drive_stream(reader, request, on_event, &self.config.model)
+        drive_stream(
+            response.into_body().into_reader(),
+            request,
+            on_event,
+            &self.config.model,
+            self.config.api_key.as_deref(),
+        )
+    }
+
+    /// Non-200 handling: extract the server's `{"error": {"message"}}` when
+    /// present, map well-known statuses to typed variants, bound everything.
+    /// Server-controlled text is scrubbed of the configured credential first.
+    fn status_error(
+        &self,
+        response: &mut ureq::http::Response<ureq::Body>,
+        status: u16,
+    ) -> ProviderError {
+        let server_message = self.scrub(&read_error_body(response));
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        match status {
+            401 | 403 => ProviderError::Authentication(if server_message.is_empty() {
+                "endpoint rejected the credentials; set [model] api_key or AUREL_API_KEY".into()
+            } else {
+                server_message
+            }),
+            407 => ProviderError::Authentication("proxy authentication required".into()),
+            429 => ProviderError::RateLimited {
+                message: if server_message.is_empty() {
+                    "too many requests".into()
+                } else {
+                    server_message
+                },
+                retry_after_secs: retry_after,
+            },
+            _ => ProviderError::Http {
+                status,
+                message: if server_message.is_empty() {
+                    "unexpected status with no error detail".into()
+                } else {
+                    server_message
+                },
+            },
+        }
     }
 }
 
@@ -245,21 +300,25 @@ impl ModelProvider for OpenAiCompatible {
             // Requested fallback: plain one-shot, nothing delivered early.
             return self.chat(request);
         }
-        // The headers phase may retry; once bytes flow, a failure is final
-        // (partial text already delivered must not repeat).
-        let mut started = false;
-        self.with_retries(request, || {
-            if started {
-                return Err(ProviderError::StreamError(
-                    "not retrying a stream that already delivered content".into(),
-                ));
+        // Retry boundary is explicit, not inferred: only FailedClean (nothing
+        // user-visible delivered) may retry. FailedPartial returns at once —
+        // no retry, no extra backoff, no duplicated deltas.
+        let mut attempt: u32 = 0;
+        loop {
+            check_cancelled(request)?;
+            match self.stream_once(request, on_event) {
+                AttemptOutcome::Done(response) => return Ok(response),
+                AttemptOutcome::FailedPartial(error) => return Err(error),
+                AttemptOutcome::FailedClean(error) => {
+                    if error.retryable() && attempt < self.retries() {
+                        attempt += 1;
+                        cancellable_wait(request, retry_delay(attempt, retry_hint(&error)))?;
+                    } else {
+                        return Err(error);
+                    }
+                }
             }
-            let result = self.stream_once(request, on_event);
-            if is_partial_stream_failure(&result) {
-                started = true;
-            }
-            result
-        })
+        }
     }
 }
 
@@ -279,19 +338,77 @@ fn ensure_usable(request: &ChatRequest) -> Result<(), ProviderError> {
 }
 
 fn check_cancelled(request: &ChatRequest) -> Result<(), ProviderError> {
-    if request
-        .cancel
-        .as_ref()
-        .is_some_and(CancelFlag::is_cancelled)
-    {
+    if is_cancelled(request) {
         return Err(ProviderError::Cancelled);
     }
     Ok(())
 }
 
-/// A stream failure after delivery started must not be retried.
-fn is_partial_stream_failure(result: &Result<ChatResponse, ProviderError>) -> bool {
-    matches!(result, Err(ProviderError::StreamError(_)))
+fn is_cancelled(request: &ChatRequest) -> bool {
+    request
+        .cancel
+        .as_ref()
+        .is_some_and(CancelFlag::is_cancelled)
+}
+
+/// Upper bound for any single backoff wait.
+const MAX_BACKOFF: Duration = Duration::from_secs(5);
+/// Sleep quantum for cancellation-aware waits.
+const WAIT_QUANTUM: Duration = Duration::from_millis(10);
+
+/// Pure retry-scheduling decision (unit-tested): linear backoff
+/// (`RETRY_BASE` × attempt, capped), raised to the server's numeric
+/// `Retry-After` hint when larger, never above the cap.
+///
+/// Only numeric delta-seconds hints are honored — this provider parses just
+/// that form (HTTP-date form falls back to plain backoff; documented in
+/// `docs/model-providers.md`).
+fn retry_delay(attempt: u32, retry_after_secs: Option<u64>) -> Duration {
+    let base = RETRY_BASE.saturating_mul(attempt).min(MAX_BACKOFF);
+    match retry_after_secs {
+        Some(hint) => base.max(Duration::from_secs(hint).min(MAX_BACKOFF)),
+        None => base,
+    }
+}
+
+/// Extract the server retry hint from a failure, if it carries one.
+fn retry_hint(error: &ProviderError) -> Option<u64> {
+    match error {
+        ProviderError::RateLimited {
+            retry_after_secs, ..
+        } => *retry_after_secs,
+        _ => None,
+    }
+}
+
+/// Bounded sleep that observes cooperative cancellation throughout the wait
+/// instead of only after it. Synchronous: short quanta, no threads, no
+/// runtime. Returns [`ProviderError::Cancelled`] as soon as the flag is set.
+fn cancellable_wait(request: &ChatRequest, duration: Duration) -> Result<(), ProviderError> {
+    let deadline = std::time::Instant::now() + duration;
+    loop {
+        check_cancelled(request)?;
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Ok(());
+        }
+        std::thread::sleep(WAIT_QUANTUM.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+/// Outcome of one streaming attempt, tracked as explicit state — never
+/// inferred from the error variant afterwards.
+#[derive(Debug)]
+enum AttemptOutcome {
+    /// Full response assembled (terminator seen, content non-empty).
+    Done(ChatResponse),
+    /// Failed before any user-visible delta was delivered: the caller may
+    /// retry per the normal retry policy. Nothing was shown, so nothing
+    /// can duplicate.
+    FailedClean(ProviderError),
+    /// Failed after delivering one or more user-visible deltas: final.
+    /// Must never be retried — a retry would print content twice.
+    FailedPartial(ProviderError),
 }
 
 /// Syntactic base-URL check only (reachability is proven at request time):
@@ -318,8 +435,16 @@ fn validate_base_url(url: &str) -> Result<(), ProviderError> {
     Ok(())
 }
 
+fn wire_role(role: Role) -> &'static str {
+    match role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+    }
+}
+
 fn wire_message(message: &Message) -> serde_json::Value {
-    serde_json::json!({ "role": message.role.as_str(), "content": message.content })
+    serde_json::json!({ "role": wire_role(message.role), "content": message.content })
 }
 
 /// Map transport failures. Messages carry status/phase information only —
@@ -363,41 +488,6 @@ fn map_transport_error(e: ureq::Error) -> ProviderError {
     }
 }
 
-/// Non-200 handling: extract the server's `{"error": {"message"}}` when
-/// present, map well-known statuses to typed variants, bound everything.
-fn status_error(response: &mut ureq::http::Response<ureq::Body>, status: u16) -> ProviderError {
-    let server_message = read_error_body(response);
-    let retry_after = response
-        .headers()
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<u64>().ok());
-    match status {
-        401 | 403 => ProviderError::Authentication(if server_message.is_empty() {
-            "endpoint rejected the credentials; set [model] api_key or AUREL_API_KEY".into()
-        } else {
-            server_message
-        }),
-        407 => ProviderError::Authentication("proxy authentication required".into()),
-        429 => ProviderError::RateLimited {
-            message: if server_message.is_empty() {
-                "too many requests".into()
-            } else {
-                server_message
-            },
-            retry_after_secs: retry_after,
-        },
-        _ => ProviderError::Http {
-            status,
-            message: if server_message.is_empty() {
-                "unexpected status with no error detail".into()
-            } else {
-                server_message
-            },
-        },
-    }
-}
-
 /// Read a bounded error body and prefer the OpenAI `error.message` shape.
 fn read_error_body(response: &mut ureq::http::Response<ureq::Body>) -> String {
     let text = match read_limited_body(response.body_mut(), MAX_ERROR_BODY) {
@@ -434,6 +524,24 @@ fn clip(text: &str) -> String {
     } else {
         text.to_string()
     }
+}
+
+/// Free-function form of [`OpenAiCompatible::scrub`] for pure parsing paths
+/// that only hold the key, not the whole provider.
+///
+/// Policy: replace both the bare key and the `Bearer <key>` form with
+/// `<redacted>`. Empty/missing keys are skipped (an empty needle would match
+/// everywhere). Replacement happens before bounding ([`clip`]) so a key
+/// straddling the clip boundary cannot leak partially.
+fn scrub_opt(text: &str, api_key: Option<&str>) -> String {
+    let Some(key) = api_key.filter(|key| !key.is_empty()) else {
+        return text.to_string();
+    };
+    let bearer = format!("Bearer {key}");
+    let scrubbed = text
+        .replace(&bearer, "Bearer <redacted>")
+        .replace(key, "<redacted>");
+    clip(&scrubbed)
 }
 
 // ---------------------------------------------------------------------------
@@ -476,14 +584,24 @@ struct WireUsage {
 
 /// Parse a 200 response body. Never panics; every shape violation is a
 /// typed error. Empty assistant content is [`ProviderError::EmptyResponse`].
-fn parse_chat_body(text: &str, configured_model: &str) -> Result<ChatResponse, ProviderError> {
+///
+/// `api_key` scopes [`scrub_opt`]: serde errors echo snippets of the server
+/// payload, which must not carry the credential.
+fn parse_chat_body(
+    text: &str,
+    configured_model: &str,
+    api_key: Option<&str>,
+) -> Result<ChatResponse, ProviderError> {
     if text.trim().is_empty() {
         return Err(ProviderError::MalformedResponse(
             "empty response body".into(),
         ));
     }
     let body: ChatBody = serde_json::from_str(text).map_err(|e| {
-        ProviderError::MalformedResponse(format!("response is not valid chat JSON: {e}"))
+        ProviderError::MalformedResponse(scrub_opt(
+            &format!("response is not valid chat JSON: {e}"),
+            api_key,
+        ))
     })?;
     let choice = body.choices.into_iter().next().ok_or_else(|| {
         ProviderError::MalformedResponse("response has no 'choices' entries".into())
@@ -562,7 +680,10 @@ struct StreamDelta {
 /// deliberately unsupported — OpenAI-compatible chat servers emit one JSON
 /// event per line, and a split payload is treated as the framing violation
 /// it would be on those servers.
-fn parse_sse_line(line: &str) -> Result<SseOutcome, ProviderError> {
+///
+/// `api_key` scopes [`scrub_opt`]: serde errors echo snippets of the server
+/// payload, which must not carry the credential.
+fn parse_sse_line(line: &str, api_key: Option<&str>) -> Result<SseOutcome, ProviderError> {
     let line = line.trim();
     if line.is_empty() || line.starts_with(':') {
         return Ok(SseOutcome::Skip);
@@ -574,8 +695,9 @@ fn parse_sse_line(line: &str) -> Result<SseOutcome, ProviderError> {
     if data == "[DONE]" {
         return Ok(SseOutcome::Done);
     }
-    let chunk: StreamChunk = serde_json::from_str(data)
-        .map_err(|e| ProviderError::StreamError(format!("malformed stream chunk: {e}")))?;
+    let chunk: StreamChunk = serde_json::from_str(data).map_err(|e| {
+        ProviderError::StreamError(scrub_opt(&format!("malformed stream chunk: {e}"), api_key))
+    })?;
     let mut delta = String::new();
     let mut finish = None;
     for choice in &chunk.choices {
@@ -597,48 +719,154 @@ fn parse_sse_line(line: &str) -> Result<SseOutcome, ProviderError> {
     })
 }
 
+/// Bounded SSE line reader: the [`MAX_SSE_LINE`] limit is enforced *during*
+/// reading, so an oversized line errors before it can grow without bound
+/// (unlike `BufRead::lines`, which allocates first and asks later).
+/// Returns lines without the trailing newline, mirroring `BufRead::lines`
+/// (a trailing `\r` goes with it); a final unterminated line is still
+/// returned once before `None`. Invalid UTF-8 is a stream error (SSE is UTF-8 by spec).
+/// A final unterminated line is still returned once before `None`.
+struct SseReader<R> {
+    inner: std::io::BufReader<R>,
+    buf: Vec<u8>,
+}
+
+impl<R: std::io::Read> SseReader<R> {
+    fn new(reader: R) -> Self {
+        SseReader {
+            inner: std::io::BufReader::new(reader),
+            buf: Vec::new(),
+        }
+    }
+
+    fn next_line(&mut self) -> Result<Option<String>, ProviderError> {
+        use std::io::BufRead;
+        self.buf.clear();
+        loop {
+            let chunk = self
+                .inner
+                .fill_buf()
+                .map_err(|e| ProviderError::StreamError(clip(&e.to_string())))?;
+            if chunk.is_empty() {
+                if self.buf.is_empty() {
+                    return Ok(None);
+                }
+                strip_newline(&mut self.buf);
+                return decode_line(std::mem::take(&mut self.buf));
+            }
+            match chunk.iter().position(|&b| b == b'\n') {
+                Some(i) => {
+                    let take = i + 1;
+                    if self.buf.len() + take > MAX_SSE_LINE {
+                        return Err(ProviderError::StreamError(
+                            "stream line exceeded the size limit".into(),
+                        ));
+                    }
+                    self.buf.extend_from_slice(&chunk[..take]);
+                    self.inner.consume(take);
+                    strip_newline(&mut self.buf);
+                    return decode_line(std::mem::take(&mut self.buf));
+                }
+                None => {
+                    if self.buf.len() + chunk.len() > MAX_SSE_LINE {
+                        return Err(ProviderError::StreamError(
+                            "stream line exceeded the size limit".into(),
+                        ));
+                    }
+                    let n = chunk.len();
+                    self.buf.extend_from_slice(chunk);
+                    self.inner.consume(n);
+                }
+            }
+        }
+    }
+}
+
+/// Drop one trailing `\n` and its optional preceding `\r`, like `lines()`.
+fn strip_newline(buf: &mut Vec<u8>) {
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+    }
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+}
+
+fn decode_line(buf: Vec<u8>) -> Result<Option<String>, ProviderError> {
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|_| ProviderError::StreamError("stream chunk is not valid UTF-8".into()))
+}
+
 /// Drive a stream to completion: deliver deltas in order, honor cancel and
 /// the consumer verdict, bound memory. Time is bounded by the transport's
-/// overall timeout; cancellation is checked before every chunk.
+/// overall timeout; cancellation (flag and consumer verdict) is checked
+/// before every chunk — a read already blocked in the OS still waits out
+/// the transport timeout (documented limitation, see
+/// `docs/model-providers.md`).
+///
+/// Delivery state is explicit: `delivered` flips only when a non-empty
+/// delta reaches `on_event`. Every failure maps through the local `fail`
+/// closure, so partial output (`FailedPartial`) is never retried while
+/// clean failures (`FailedClean`) may be.
 fn drive_stream(
     reader: impl std::io::Read,
     request: &ChatRequest,
     on_event: &mut dyn FnMut(StreamEvent) -> StreamControl,
     configured_model: &str,
-) -> Result<ChatResponse, ProviderError> {
-    let lines = std::io::BufReader::new(reader).lines();
+    api_key: Option<&str>,
+) -> AttemptOutcome {
+    let fail = |delivered: bool, error: ProviderError| {
+        if delivered {
+            AttemptOutcome::FailedPartial(error)
+        } else {
+            AttemptOutcome::FailedClean(error)
+        }
+    };
+    let mut reader = SseReader::new(reader);
     let mut content = String::new();
+    let mut delivered = false;
     let mut finish_reason = None;
     let mut usage = None;
     let mut done = false;
 
-    for line in lines {
-        check_cancelled(request)?;
-        let line = line.map_err(|e| ProviderError::StreamError(clip(&e.to_string())))?;
-        if line.len() > MAX_SSE_LINE {
-            return Err(ProviderError::StreamError("stream chunk too large".into()));
+    loop {
+        if is_cancelled(request) {
+            return fail(delivered, ProviderError::Cancelled);
         }
-        match parse_sse_line(&line)? {
-            SseOutcome::Skip => {}
-            SseOutcome::Done => {
+        let line = match reader.next_line() {
+            Ok(None) => break,
+            Ok(Some(line)) => line,
+            Err(error) => return fail(delivered, error),
+        };
+        match parse_sse_line(&line, api_key) {
+            Err(error) => return fail(delivered, error),
+            Ok(SseOutcome::Skip) => {}
+            Ok(SseOutcome::Done) => {
                 done = true;
                 break;
             }
-            SseOutcome::Chunk {
+            Ok(SseOutcome::Chunk {
                 delta,
                 finish,
                 usage: chunk_usage,
-            } => {
+            }) => {
                 if !delta.is_empty() {
                     if content.len() + delta.len() > MAX_STREAM_CONTENT {
-                        return Err(ProviderError::StreamError(
-                            "streamed content exceeded the size limit".into(),
-                        ));
+                        return fail(
+                            delivered,
+                            ProviderError::StreamError(
+                                "streamed content exceeded the size limit".into(),
+                            ),
+                        );
                     }
                     content.push_str(&delta);
+                    delivered = true;
                     match on_event(StreamEvent { delta }) {
                         StreamControl::Continue => {}
-                        StreamControl::Cancel => return Err(ProviderError::Cancelled),
+                        StreamControl::Cancel => {
+                            return fail(delivered, ProviderError::Cancelled);
+                        }
                     }
                 }
                 if finish.is_some() {
@@ -651,15 +879,15 @@ fn drive_stream(
         }
     }
 
-    if !done && content.is_empty() {
-        return Err(ProviderError::StreamError(
+    if !done && !delivered {
+        return AttemptOutcome::FailedClean(ProviderError::StreamError(
             "stream ended without a terminator".into(),
         ));
     }
     if content.is_empty() {
-        return Err(ProviderError::EmptyResponse);
+        return AttemptOutcome::FailedClean(ProviderError::EmptyResponse);
     }
-    Ok(ChatResponse {
+    AttemptOutcome::Done(ChatResponse {
         content,
         role: Role::Assistant,
         model: configured_model.to_string(),
@@ -739,7 +967,7 @@ mod tests {
                 "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
         }"#;
-        let res = parse_chat_body(text, "fallback").expect("valid body");
+        let res = parse_chat_body(text, "fallback", None).expect("valid body");
         assert_eq!(res.content, "Hello!");
         assert_eq!(res.model, "m");
         assert_eq!(res.finish_reason, Some(FinishReason::Stop));
@@ -756,26 +984,27 @@ mod tests {
     #[test]
     fn rejects_malformed_and_empty_bodies() {
         assert!(matches!(
-            parse_chat_body("", "m"),
+            parse_chat_body("", "m", None),
             Err(ProviderError::MalformedResponse(_))
         ));
         assert!(matches!(
-            parse_chat_body("not json", "m"),
+            parse_chat_body("not json", "m", None),
             Err(ProviderError::MalformedResponse(_))
         ));
         assert!(matches!(
-            parse_chat_body(r#"{"choices": []}"#, "m"),
+            parse_chat_body(r#"{"choices": []}"#, "m", None),
             Err(ProviderError::MalformedResponse(_))
         ));
         assert!(matches!(
-            parse_chat_body(r#"{"nope": true}"#, "m"),
+            parse_chat_body(r#"{"nope": true}"#, "m", None),
             Err(ProviderError::MalformedResponse(_))
         ));
         // Present-but-empty content is EmptyResponse, not success.
         assert!(matches!(
             parse_chat_body(
                 r#"{"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]}"#,
-                "m"
+                "m",
+                None,
             ),
             Err(ProviderError::EmptyResponse)
         ));
@@ -783,7 +1012,8 @@ mod tests {
         assert!(matches!(
             parse_chat_body(
                 r#"{"choices": [{"message": {}, "finish_reason": "stop"}]}"#,
-                "m"
+                "m",
+                None,
             ),
             Err(ProviderError::EmptyResponse)
         ));
@@ -791,14 +1021,18 @@ mod tests {
 
     #[test]
     fn sse_line_parser_handles_protocol_shapes() {
-        assert_eq!(parse_sse_line(""), Ok(SseOutcome::Skip));
-        assert_eq!(parse_sse_line(": comment"), Ok(SseOutcome::Skip));
-        assert_eq!(parse_sse_line("event: message"), Ok(SseOutcome::Skip));
-        assert_eq!(parse_sse_line("data: [DONE]"), Ok(SseOutcome::Done));
-        assert_eq!(parse_sse_line("data:  [DONE]  "), Ok(SseOutcome::Done));
+        assert_eq!(parse_sse_line("", None), Ok(SseOutcome::Skip));
+        assert_eq!(parse_sse_line(": comment", None), Ok(SseOutcome::Skip));
+        assert_eq!(parse_sse_line("event: message", None), Ok(SseOutcome::Skip));
+        assert_eq!(parse_sse_line("data: [DONE]", None), Ok(SseOutcome::Done));
+        assert_eq!(
+            parse_sse_line("data:  [DONE]  ", None),
+            Ok(SseOutcome::Done)
+        );
 
         let chunk = parse_sse_line(
             r#"data: {"choices": [{"delta": {"content": "Hi"}, "finish_reason": null}]}"#,
+            None,
         )
         .expect("chunk");
         assert!(matches!(
@@ -807,13 +1041,169 @@ mod tests {
         ));
 
         assert!(matches!(
-            parse_sse_line("data: {broken"),
+            parse_sse_line("data: {broken", None),
             Err(ProviderError::StreamError(_))
         ));
         // Valid JSON without usable delta: skipped, not fatal.
         assert!(matches!(
-            parse_sse_line(r#"data: {"foo": 1}"#),
+            parse_sse_line(r#"data: {"foo": 1}"#, None),
             Ok(SseOutcome::Chunk { .. })
         ));
+    }
+
+    #[test]
+    fn wire_role_spellings() {
+        assert_eq!(wire_role(Role::System), "system");
+        assert_eq!(wire_role(Role::User), "user");
+        assert_eq!(wire_role(Role::Assistant), "assistant");
+    }
+
+    #[test]
+    fn retry_delay_uses_hint_within_bounds() {
+        use std::time::Duration;
+        // Plain linear backoff without a hint.
+        assert_eq!(retry_delay(1, None), Duration::from_millis(250));
+        assert_eq!(retry_delay(2, None), Duration::from_millis(500));
+        assert_eq!(retry_delay(100, None), Duration::from_secs(5));
+        // A larger server hint wins, but never above the cap.
+        assert_eq!(retry_delay(1, Some(4)), Duration::from_secs(4));
+        assert_eq!(retry_delay(1, Some(100)), Duration::from_secs(5));
+        // A zero hint falls back to base backoff (never hammer).
+        assert_eq!(retry_delay(1, Some(0)), Duration::from_millis(250));
+        assert_eq!(retry_delay(3, Some(0)), Duration::from_millis(750));
+        // A larger hint wins (bounded above).
+        assert_eq!(retry_delay(3, Some(1)), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn cancellable_wait_observes_the_flag() {
+        use std::time::{Duration, Instant};
+        let req = ChatRequest::one_shot("hi", false);
+        // Uncancelled short wait completes normally.
+        cancellable_wait(&req, Duration::from_millis(20)).expect("short wait");
+        // A pre-cancelled flag aborts a long wait immediately.
+        let cancelled = ChatRequest {
+            cancel: Some(CancelFlag::cancelled()),
+            ..ChatRequest::one_shot("hi", false)
+        };
+        let start = Instant::now();
+        assert!(matches!(
+            cancellable_wait(&cancelled, Duration::from_secs(30)),
+            Err(ProviderError::Cancelled)
+        ));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "cancel must shortcut the wait"
+        );
+    }
+
+    #[test]
+    fn scrub_removes_key_and_bearer_everywhere() {
+        let key = "sk-test-secret-9";
+        // Bare key and Bearer form both go.
+        assert_eq!(
+            scrub_opt("oops sk-test-secret-9 here", Some(key)),
+            "oops <redacted> here"
+        );
+        assert_eq!(
+            scrub_opt("oops Bearer sk-test-secret-9 here", Some(key)),
+            "oops Bearer <redacted> here"
+        );
+        // A key straddling the clip boundary cannot leak partially: it is
+        // replaced before bounding, so at worst the marker itself is cut.
+        let padded = format!("{}tail {}", "x".repeat(600), key);
+        let scrubbed = scrub_opt(&padded, Some(key));
+        assert!(!scrubbed.contains(key), "partial leak: {scrubbed:?}");
+        assert!(scrubbed.len() <= MAX_DIAG_CHARS + 32, "still bounded");
+        // Missing/empty keys pass text through untouched.
+        assert_eq!(scrub_opt("plain", None), "plain");
+        assert_eq!(scrub_opt("plain", Some("")), "plain");
+    }
+
+    #[test]
+    fn sse_reader_round_trips_normal_lines() {
+        let input = "data: one\r\ndata: two\n\n: comment\npartial";
+        let mut reader = SseReader::new(input.as_bytes());
+        assert_eq!(
+            reader.next_line().expect("l1"),
+            Some("data: one".to_string())
+        );
+        assert_eq!(
+            reader.next_line().expect("l2"),
+            Some("data: two".to_string())
+        );
+        assert_eq!(reader.next_line().expect("l3"), Some(String::new()));
+        assert_eq!(
+            reader.next_line().expect("l4"),
+            Some(": comment".to_string())
+        );
+        assert_eq!(reader.next_line().expect("l5"), Some("partial".to_string()));
+        assert_eq!(reader.next_line().expect("eof"), None);
+    }
+
+    /// A reader that yields endless 1 KiB chunks with no newline.
+    struct EndlessX {
+        chunks: std::cell::Cell<usize>,
+    }
+
+    impl std::io::Read for EndlessX {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.chunks.set(self.chunks.get() + 1);
+            let n = buf.len().min(1024);
+            buf[..n].fill(b'x');
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn sse_reader_rejects_oversized_lines_without_huge_allocs() {
+        // The old `lines()` approach would grow forever here; the bounded
+        // reader must fail after ~1 MiB / 1 KiB per chunk reads.
+        let source = EndlessX {
+            chunks: std::cell::Cell::new(0),
+        };
+        let mut reader = SseReader::new(source);
+        let err = reader.next_line().expect_err("must reject the line");
+        assert!(matches!(err, ProviderError::StreamError(_)), "{err:?}");
+        let chunks = reader.inner.get_ref().chunks.get();
+        assert!(
+            chunks <= 1100,
+            "allocation must stay bounded, used {chunks} KiB chunks"
+        );
+    }
+
+    #[test]
+    fn drive_outcome_distinguishes_clean_from_partial() {
+        fn run(text: &str) -> AttemptOutcome {
+            let req = ChatRequest::one_shot("hi", true);
+            drive_stream(
+                text.as_bytes(),
+                &req,
+                &mut |_| StreamControl::Continue,
+                "m",
+                None,
+            )
+        }
+        // Garbage before any delta: clean failure (retryable by the caller).
+        assert!(matches!(
+            run("data: {broken\n\n"),
+            AttemptOutcome::FailedClean(ProviderError::StreamError(_))
+        ));
+        // Delta first, then garbage: partial failure (never retry).
+        let mut deltas = 0;
+        let req = ChatRequest::one_shot("hi", true);
+        let outcome = drive_stream(
+            "data: {\"choices\": [{\"delta\": {\"content\": \"a\"}}]}\n\ndata: {broken\n\n"
+                .as_bytes(),
+            &req,
+            &mut |_| {
+                deltas += 1;
+                StreamControl::Continue
+            },
+            "m",
+            None,
+        );
+        assert!(matches!(outcome, AttemptOutcome::FailedPartial(_)));
+        assert_eq!(deltas, 1, "exactly one user-visible delta");
     }
 }

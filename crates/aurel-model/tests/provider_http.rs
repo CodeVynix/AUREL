@@ -547,3 +547,163 @@ fn provider_capabilities_are_conservative() {
     assert!(!caps.structured_output);
     assert_eq!(caps.context_window, None);
 }
+
+#[test]
+fn chat_cancel_during_backoff_aborts_promptly() {
+    // Every attempt would fail retryably; cancel fires mid-backoff. The
+    // uncancelled chain would wait 250+500+750ms+… across 6 attempts —
+    // cancellation must shortcut it after the first attempt.
+    let (base, captured, server) = serve_all(vec![Canned::json(500, "boom")]);
+    let flag = CancelFlag::new();
+    let canceller = flag.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        canceller.cancel();
+    });
+    let provider = OpenAiCompatible::new(OpenAiConfig {
+        base_url: base,
+        model: "test-model".to_string(),
+        api_key: None,
+        timeout: Duration::from_secs(10),
+        max_retries: 5,
+    })
+    .expect("provider");
+    let req = ChatRequest {
+        messages: vec![Message::user("hello")],
+        stream: false,
+        cancel: Some(flag),
+    };
+
+    let start = std::time::Instant::now();
+    let err = provider.chat(&req).expect_err("must cancel");
+    let elapsed = start.elapsed();
+    assert!(matches!(err, ProviderError::Cancelled), "{err:?}");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "cancel must shortcut backoff, took {elapsed:?}"
+    );
+    let hits = captured.lock().expect("lock").len();
+    assert_eq!(hits, 1, "cancel must stop the retry chain, saw {hits}");
+    server.join().expect("server finishes");
+}
+
+#[test]
+fn stream_retries_before_first_delta() {
+    let (base, captured, server) = serve_all(vec![
+        Canned::json(500, "boom"),
+        Canned::sse(
+            "data: {\"choices\": [{\"delta\": {\"content\": \"late\"}}]}\n\ndata: [DONE]\n\n",
+        ),
+    ]);
+    let provider = provider(&base, Duration::from_secs(5), 1, None);
+
+    let mut deltas = Vec::new();
+    let res = provider
+        .chat_stream(&request(true), &mut |event| {
+            deltas.push(event.delta.clone());
+            aurel_model::StreamControl::Continue
+        })
+        .expect("recovers before any content");
+    assert_eq!(res.content, "late");
+    assert_eq!(deltas, vec!["late".to_string()]);
+    assert_eq!(captured.lock().expect("lock").len(), 2);
+    server.join().expect("server finishes");
+}
+
+#[test]
+fn stream_failure_after_delta_never_retries_or_duplicates() {
+    let sse = concat!(
+        "data: {\"choices\": [{\"delta\": {\"content\": \"one\"}}]}\n\n",
+        "data: {broken\n\n",
+    );
+    let (base, captured, server) = serve_all(vec![Canned::sse(sse)]);
+    let provider = provider(&base, Duration::from_secs(5), 3, None);
+
+    let mut deltas = Vec::new();
+    let err = provider
+        .chat_stream(&request(true), &mut |event| {
+            deltas.push(event.delta.clone());
+            aurel_model::StreamControl::Continue
+        })
+        .expect_err("must fail");
+    assert!(matches!(err, ProviderError::StreamError(_)), "{err:?}");
+    // Exactly one connection: no retry after user-visible output.
+    assert_eq!(captured.lock().expect("lock").len(), 1);
+    // Exactly one delivery: nothing duplicated.
+    assert_eq!(deltas, vec!["one".to_string()]);
+    server.join().expect("server finishes");
+}
+
+#[test]
+fn stream_cancel_during_stall_returns_promptly() {
+    // Chunked delivery with a long pause mid-stream; the cancel flag fires
+    // from the first callback, so the client must abort before the next
+    // chunk instead of stalling. The server thread is detached (it wakes
+    // from its pause after the test ends).
+    let sse = concat!(
+        "data: {\"choices\": [{\"delta\": {\"content\": \"first\"}}]}\n\n",
+        "data: {\"choices\": [{\"delta\": {\"content\": \"second\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let mut canned = Canned::sse(sse);
+    canned.chunk = Some((60, Duration::from_secs(5)));
+    let (base, _, _) = serve_all(vec![canned]);
+    let provider = provider(&base, Duration::from_secs(30), 0, None);
+    let flag = CancelFlag::new();
+    let canceller = flag.clone();
+    let req = ChatRequest {
+        messages: vec![Message::user("hello")],
+        stream: true,
+        cancel: Some(flag),
+    };
+
+    let start = std::time::Instant::now();
+    let err = provider
+        .chat_stream(&req, &mut |_| {
+            canceller.cancel();
+            aurel_model::StreamControl::Continue
+        })
+        .expect_err("must cancel");
+    assert!(matches!(err, ProviderError::Cancelled), "{err:?}");
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "cancel must preempt the stall, took {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn retry_after_hint_is_honored_without_slowness() {
+    // Hint 0 keeps the fast base backoff: proves the hint path runs
+    // end-to-end (scheduling values are pinned by unit test).
+    let mut canned = Canned::json(429, r#"{"error": {"message": "slow down"}}"#);
+    canned
+        .extra_headers
+        .push(("Retry-After".into(), "0".into()));
+    let (base, captured, server) = serve_all(vec![canned, Canned::json(200, &chat_json("kept"))]);
+    let provider = provider(&base, Duration::from_secs(5), 1, None);
+
+    let res = provider.chat(&request(false)).expect("recovers");
+    assert_eq!(res.content, "kept");
+    assert_eq!(captured.lock().expect("lock").len(), 2);
+    server.join().expect("server finishes");
+}
+
+#[test]
+fn server_echo_of_api_key_is_scrubbed() {
+    // Exact manually-tested reproduction: the server parrots the bearer
+    // credential inside its error message.
+    let key = "sk-test-secret-123";
+    let body = format!(r#"{{"error": {{"message": "Bearer {key}"}}}}"#);
+    let (base, _, server) = serve_all(vec![Canned::json(401, &body)]);
+    let provider = provider(&base, Duration::from_secs(5), 0, Some(key));
+
+    let err = provider.chat(&request(false)).expect_err("must fail");
+    assert!(matches!(err, ProviderError::Authentication(_)), "{err:?}");
+    let text = err.to_string();
+    assert!(!text.contains(key), "credential leaked: {text:?}");
+    assert!(text.contains("Bearer <redacted>"), "got: {text:?}");
+    // Same guarantee through Debug formatting.
+    assert!(!format!("{err:?}").contains(key));
+    server.join().expect("server finishes");
+}
