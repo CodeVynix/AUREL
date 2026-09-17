@@ -1,4 +1,4 @@
-# AUREL Configuration — Phase 3
+# AUREL Configuration — Phase 4
 
 TOML configuration with deterministic precedence. Only settings actually
 needed at this stage exist; the schema grows in later phases.
@@ -46,10 +46,15 @@ Unknown keys are rejected (`deny_unknown_fields`) so typos fail loudly.
 | Key | Type | Default | Sources |
 | --- | ---- | ------- | ------- |
 | `max_iterations` | integer | `5` | file, `AUREL_MAX_ITERATIONS`, `--max-iterations` |
+| `auto_compaction` | boolean | `true` | file, `AUREL_AUTO_COMPACTION` (`/settings` in the loop) |
 
 Bounds one `aurel agent` run to that many provider calls. Values above 100
 are rejected by the loop with a clean error; `0` is rejected by the CLI
 flag parser (exit 2) and by the loop (exit 1) alike.
+
+`auto_compaction` triggers a model-made summary once history passes 20
+messages (newest 4 kept). `/settings set auto_compaction on|off` toggles it
+for the running session only — Phase 4 performs no file writes.
 
 ## Precedence
 
@@ -136,6 +141,7 @@ streaming = true
 
 [agent]
 max_iterations = 5
+auto_compaction = true
 ```
 
 ## Errors and exit codes

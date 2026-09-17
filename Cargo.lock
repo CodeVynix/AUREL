@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "aurel-cli"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aurel-config",
  "aurel-core",
@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "aurel-config"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "toml",
@@ -21,11 +21,11 @@ dependencies = [
 
 [[package]]
 name = "aurel-core"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "aurel-model"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",

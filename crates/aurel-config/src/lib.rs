@@ -49,6 +49,8 @@ pub const ENV_MAX_RETRIES: &str = "AUREL_MAX_RETRIES";
 pub const ENV_STREAMING: &str = "AUREL_STREAMING";
 /// Environment variable overriding `[agent] max_iterations`.
 pub const ENV_MAX_ITERATIONS: &str = "AUREL_MAX_ITERATIONS";
+/// Environment variable overriding `[agent] auto_compaction` (`true`/`false`).
+pub const ENV_AUTO_COMPACTION: &str = "AUREL_AUTO_COMPACTION";
 
 /// Log verbosity. Spelled lowercase in every source; parsing is
 /// case-insensitive.
@@ -212,11 +214,17 @@ struct ModelFileConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentSettings {
     pub max_iterations: u32,
+    /// Compact history automatically once it passes the threshold.
+    /// Default on; toggle at runtime via `/settings`.
+    pub auto_compaction: bool,
 }
 
 impl Default for AgentSettings {
     fn default() -> Self {
-        AgentSettings { max_iterations: 5 }
+        AgentSettings {
+            max_iterations: 5,
+            auto_compaction: true,
+        }
     }
 }
 
@@ -227,6 +235,8 @@ impl Default for AgentSettings {
 struct AgentFileConfig {
     #[serde(default)]
     max_iterations: Option<u32>,
+    #[serde(default)]
+    auto_compaction: Option<bool>,
 }
 
 /// Partial configuration as read from a single TOML file.
@@ -511,6 +521,9 @@ fn apply_file(
         if let Some(max) = table.max_iterations {
             agent.max_iterations = max;
         }
+        if let Some(auto) = table.auto_compaction {
+            agent.auto_compaction = auto;
+        }
     }
 }
 
@@ -564,6 +577,13 @@ fn apply_agent_env(
             var: ENV_MAX_ITERATIONS.to_string(),
             value: value.clone(),
             message: "expected an iteration count as an unsigned integer".to_string(),
+        })?;
+    }
+    if let Some(value) = env.get(ENV_AUTO_COMPACTION) {
+        agent.auto_compaction = parse_toggle(value).map_err(|e| ConfigError::InvalidEnv {
+            var: ENV_AUTO_COMPACTION.to_string(),
+            value: value.clone(),
+            message: e.to_string(),
         })?;
     }
     Ok(())
@@ -674,6 +694,10 @@ pub fn render_show(cfg: &EffectiveConfig) -> String {
     out.push_str(&format!("streaming = {}\n", cfg.model.streaming));
     out.push_str("\n[agent]\n");
     out.push_str(&format!("max_iterations = {}\n", cfg.agent.max_iterations));
+    out.push_str(&format!(
+        "auto_compaction = {}\n",
+        cfg.agent.auto_compaction
+    ));
     out
 }
 
@@ -1020,18 +1044,30 @@ mod tests {
     fn agent_precedence_is_file_env_cli() {
         let dir = test_dir("agent-precedence");
         let project = dir.join("project.toml");
-        write(&project, "[agent]\nmax_iterations = 2\n");
+        write(
+            &project,
+            "[agent]\nmax_iterations = 2\nauto_compaction = false\n",
+        );
         let mut req = request();
         req.project_file = Some(project);
         req.project_searched = true;
 
-        assert_eq!(load(&req).expect("file").agent.max_iterations, 2);
+        let cfg = load(&req).expect("file");
+        assert_eq!(cfg.agent.max_iterations, 2);
+        assert!(!cfg.agent.auto_compaction);
 
         req.env.insert(ENV_MAX_ITERATIONS.into(), "7".into());
-        assert_eq!(load(&req).expect("env").agent.max_iterations, 7);
+        req.env.insert(ENV_AUTO_COMPACTION.into(), "true".into());
+        let cfg = load(&req).expect("env");
+        assert_eq!(cfg.agent.max_iterations, 7);
+        assert!(cfg.agent.auto_compaction);
 
         req.cli_max_iterations = Some(3);
-        assert_eq!(load(&req).expect("cli").agent.max_iterations, 3);
+        let cfg = load(&req).expect("cli");
+        assert_eq!(cfg.agent.max_iterations, 3);
+        // No CLI flag exists for the toggle by design (settings surface);
+        // the env value survives.
+        assert!(cfg.agent.auto_compaction);
     }
 
     #[test]
@@ -1041,6 +1077,12 @@ mod tests {
         let err = load(&req).expect_err("must fail");
         assert!(matches!(err, ConfigError::InvalidEnv { .. }), "{err:?}");
         assert!(err.to_string().contains(ENV_MAX_ITERATIONS), "{err:?}");
+
+        let mut req = request();
+        req.env.insert(ENV_AUTO_COMPACTION.into(), "maybe".into());
+        let err = load(&req).expect_err("must fail");
+        assert!(matches!(err, ConfigError::InvalidEnv { .. }), "{err:?}");
+        assert!(err.to_string().contains(ENV_AUTO_COMPACTION), "{err:?}");
     }
 
     #[test]
@@ -1061,6 +1103,7 @@ mod tests {
         let text = render_show(&load(&request()).expect("defaults"));
         assert!(text.contains("[agent]"), "got: {text:?}");
         assert!(text.contains("max_iterations = 5"), "got: {text:?}");
+        assert!(text.contains("auto_compaction = true"), "got: {text:?}");
     }
 
     #[test]

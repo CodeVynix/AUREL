@@ -4,11 +4,12 @@ AUREL is a personal, terminal-first AI coding agent. This repository holds its
 Rust implementation, built as one shared foundation with a lightweight Core
 edition and (later) an extended Normal edition.
 
-> **Status: Phase 3 — Basic agent loop.** AUREL runs bounded single-prompt
-> turn sequences via `aurel agent` (continuing truncated turns up to a
-> configured iteration bound) on top of the Phase 2 provider layer. There
-> are still no tools, no shell/Git automation, no memory, no GUI, and no
-> Normal edition. Neither `chat` nor `agent` operates the computer.
+> **Status: Phase 4 — Interaction layer + agent modes.** Bare `aurel` on a
+> terminal opens a minimal interactive loop with Plan/Build modes (Tab
+> toggles), local slash commands, `@general`/`@explore` scopes, `/btw`
+> side questions, `/compact`, and `/new`, on top of the bounded agent loop.
+> There are still no tools, no shell/Git automation, no memory, no GUI, and
+> no Normal edition. Nothing here operates the computer.
 
 ## Toolchain
 
@@ -55,16 +56,27 @@ Or with the built binary (Windows example):
 .\target\debug\aurel.exe agent "hello"
 ```
 
+Bare `aurel` on an interactive terminal opens the loop (`build>` prompt);
+with piped stdin it prints help as before:
+
+```text
+aurel interactive — build mode (Tab toggles, /help for commands, Ctrl-D to exit).
+build> /plan
+Switched to plan mode (mutations blocked).
+plan> hello
+...
+```
+
 Actual `--version` output:
 
 ```text
-aurel 0.4.0
+aurel 0.5.0
 ```
 
 Actual `--help` output:
 
 ```text
-aurel 0.4.0
+aurel 0.5.0
 Autonomous Utility & Reasoning Engine for Logic
 
 USAGE:
@@ -102,7 +114,7 @@ Behavior:
 | ---------- | --------- | ------ |
 | `aurel` | 0 | help to stdout (config files untouched) |
 | `aurel --help` / `-h` | 0 | help to stdout |
-| `aurel --version` / `-V` | 0 | `aurel 0.4.0` to stdout |
+| `aurel --version` / `-V` | 0 | `aurel 0.5.0` to stdout |
 | `aurel config show` | 0 | effective config as TOML to stdout (key redacted) |
 | `aurel config` / `aurel config --help` | 0 | command help to stdout |
 | `aurel chat "hi"` | 0 | model reply to stdout |
@@ -135,6 +147,7 @@ base_url = "http://127.0.0.1:8080/v1"
 
 [agent]
 max_iterations = 5
+auto_compaction = true
 ```
 
 Precedence: built-in defaults < global file < project file < `AUREL_*`
@@ -142,6 +155,30 @@ environment < CLI flags. `--config <path>` replaces file discovery.
 Inspect the result with `aurel config show` (the API key always prints as
 `<redacted>`). There is no `--api-key` flag — use a config file or
 `AUREL_API_KEY`.
+
+## Interactive loop
+
+Bare `aurel` on a terminal starts the loop; everything else also works
+one-shot (`aurel agent "hi"`, `aurel chat "hi"`, `aurel config show`).
+
+| Input | Effect |
+| ----- | ------ |
+| `Tab` (bare) | Toggle Plan ↔ Build |
+| `/plan`, `/build` | Switch mode (shown in prompt and `/status`) |
+| `/help`, `/version`, `/status`, `/history`, `/context` | Local reports |
+| `/compact` | Summarize history via the model, keep going |
+| `/btw <q>` | Side answer without touching the main task |
+| `/new` | Fresh session (mode preserved) |
+| `/settings [show\|set auto_compaction on\|off]` | Session-scoped settings |
+| `/config` | Effective config (key redacted) |
+| `/model`, `/tools` | Honestly report unimplemented backends |
+| `@general`, `@explore` | Prompt scope (`@explore` notes cross-session is future) |
+| `!command` | Parsed only — shell execution is not implemented yet |
+| `/exit`, `/quit`, Ctrl-D | Leave the loop |
+
+Plan mode reasons and proposes but must not mutate (`Mode::allows_mutation`
+is the gate future tools must check). Auto-compaction is on by default
+(threshold 20 messages, keeps 4); toggle per session via `/settings`.
 
 ## Test
 
@@ -166,7 +203,7 @@ Cargo.toml                  # workspace (resolver 2) + shared [workspace.package
 crates/aurel-core/          # shared library foundation (version API)
 crates/aurel-config/        # TOML loading, precedence, discovery, config errors
 crates/aurel-model/         # provider abstraction + OpenAI-compatible provider + agent loop
-crates/aurel-cli/           # `aurel` binary: std-only arg parser + dispatch
+crates/aurel-cli/           # `aurel` binary: std-only arg parser + dispatch + interactive loop
 docs/architecture.md        # what the current phase actually contains
 docs/configuration.md      # config precedence, grammar, errors
 docs/model-providers.md     # model setup, chat, streaming, errors, secrets

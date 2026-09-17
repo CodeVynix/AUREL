@@ -30,6 +30,7 @@
 //! exercise the compiled binary end to end.
 
 mod args;
+mod interactive;
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -351,14 +352,30 @@ fn run_inner(
     }
 
     match parsed.command.as_ref() {
-        // Bare invocation: help, without touching config files.
-        None => {
-            if print_help(out).is_ok() {
-                0
-            } else {
-                1
+        // Bare invocation: an interactive terminal enters the REPL; piped
+        // input keeps the Phase 0 help behavior (the injected-runtime test
+        // path also prints help deterministically).
+        None => match rt {
+            Some(_) => {
+                if print_help(out).is_ok() {
+                    0
+                } else {
+                    1
+                }
             }
-        }
+            None if !stdin_is_terminal => {
+                if print_help(out).is_ok() {
+                    0
+                } else {
+                    1
+                }
+            }
+            None => {
+                let live = Runtime::live();
+                let mut input = std::io::BufReader::new(stdin);
+                interactive::start_interactive(&live, &mut input, out, err)
+            }
+        },
         // Command paths: only here is the live runtime constructed.
         Some(Command::ConfigShow) => match rt {
             Some(injected) => execute_config_show(&parsed, out, err, injected),
@@ -632,6 +649,20 @@ fn run_agent<P: ModelProvider>(
     });
     let failed = sink.failed;
     let out = sink.out;
+    print_agent_outcome(&outcome, streaming, failed, out, err)
+}
+
+/// Print an [`AgentOutcome`] produced by [`run_agent`] or the interactive
+/// loop: progressive content is already on stdout in streaming mode, whole
+/// content prints here otherwise. Returns the exit code (0 completed, 1
+/// otherwise); the interactive loop prints but ignores it and continues.
+fn print_agent_outcome(
+    outcome: &AgentOutcome,
+    streaming: bool,
+    write_failed: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
     match outcome {
         AgentOutcome::Completed(result) => {
             if streaming {
@@ -639,7 +670,7 @@ fn run_agent<P: ModelProvider>(
             } else if writeln!(out, "{}", result.content).is_err() {
                 return 1;
             }
-            if failed {
+            if write_failed {
                 1
             } else {
                 0
@@ -659,7 +690,7 @@ fn run_agent<P: ModelProvider>(
             EXIT_RUNTIME_ERROR
         }
         AgentOutcome::Cancelled(_) => {
-            if failed {
+            if write_failed {
                 let _ = writeln!(err, "error: failed to write model output");
             } else {
                 let _ = writeln!(err, "error: agent run cancelled");
@@ -667,7 +698,7 @@ fn run_agent<P: ModelProvider>(
             EXIT_RUNTIME_ERROR
         }
         AgentOutcome::ProviderError { error, .. } => {
-            if failed {
+            if write_failed {
                 let _ = writeln!(err, "error: failed to write model output");
             } else {
                 let _ = writeln!(err, "{error}");

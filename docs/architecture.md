@@ -1,4 +1,4 @@
-# AUREL Architecture — Phase 3
+# AUREL Architecture — Phase 4
 
 This document describes what Phase 3 actually contains. Nothing more.
 
@@ -88,13 +88,40 @@ turns — append a `system` "Continue." cue and request again, up to
 warning), `Cancelled`, and `ProviderError` — each carrying accumulated
 content, call count, and summed usage. Cancellation reuses the Phase 2
 `CancelFlag`. There are no tools: the loop cannot inspect, edit, or run
-anything (that is Phase 4+).
+anything (that is Phase 5+).
+
+## Interaction layer
+
+Bare `aurel` on a terminal enters a minimal line REPL
+(`crates/aurel-cli/src/interactive.rs` — no TUI framework, injected
+streams throughout); piped input keeps the Phase 0 help behavior. One
+`Agent`/`AgentSession` pair lives for the whole loop:
+
+- Modes: `Mode::{Plan, Build}` travels with the session and is stamped
+  into every result. `/plan`, `/build`, and a bare Tab toggle it; the
+  prompt and `/status` always show it. `allows_mutation()` is the gate
+  future tools must consult — Plan performs no mutations.
+- Slash commands are parsed and dispatched locally, never sent to the
+  model: help/version/plan/build/status/compact/btw/new/history/context/
+  settings/config/tools/exit/quit. Backends owned by later phases
+  (`/model`, shell execution, cross-session retrieval) say so instead of
+  pretending.
+- `@general` (default) and `@explore` annotate one prompt's scope;
+  `@explore` answers from the current session with an explicit notice.
+- `/btw` runs a side question on a private session clone and discards it:
+  history, mode, and counters are byte-identical afterwards.
+- `/compact` (manual) and auto-compaction (on by default, threshold 20,
+  keeps 4) summarize through the model layer into one `system` message.
+- `/new` clears history (mode preserved). `/settings` toggles
+  `auto_compaction` session-scoped — no file writes in Phase 4.
+- `!command` parses as an explicit shell request and is refused with a
+  clear message; nothing executes.
 
 ## Configuration
 
 `log_level`, the `[model]` table (`name`, `base_url`, optional
 `api_key`, `timeout_secs`, `max_retries`, `streaming`), and the `[agent]`
-table (`max_iterations`), all through the
+table (`max_iterations`, `auto_compaction`), all through the
 same precedence machinery: defaults < global file < project file < env <
 CLI, plus `--config` replacing discovery. Files are TOML parsed with
 unknown-field rejection; missing files are skipped except an explicit
@@ -194,4 +221,16 @@ one module (`aurel-model/src/agent.rs`), config keys, and CLI wiring.
   (+1.3%) vs Phase 2. Still far under the < 15 MB Core target.
 - Startup, warm process start-to-exit: release `--version` ≈20–25 ms —
   unchanged; the loop builds per `agent` invocation and costs nothing
+  at startup.
+
+## Phase 4 delta (measured, informational)
+
+Same host and caveats as above. No new dependencies and no new crates —
+one CLI module (`interactive.rs`), agent-session mode/compaction methods,
+and two config keys.
+
+- Release binary: 2,920,960 bytes (≈2.79 MiB), i.e. +49,664 bytes
+  (+1.7%) vs Phase 3. Still far under the < 15 MB Core target.
+- Startup, warm process start-to-exit: release `--version` ≈24–32 ms —
+  unchanged; the REPL builds per bare invocation and costs nothing
   at startup.

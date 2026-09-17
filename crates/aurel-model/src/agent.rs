@@ -15,10 +15,68 @@ use crate::{
 /// against absurd configuration.
 pub const MAX_ITERATIONS_LIMIT: u32 = 100;
 
+/// History length above which automatic compaction may trigger.
+pub const COMPACT_AT_MESSAGES: usize = 20;
+/// Newest messages a compaction always keeps verbatim.
+pub const COMPACT_KEEP_MESSAGES: usize = 4;
+/// Per-message transcript cap (characters) when asking for a summary.
+pub const COMPACT_MESSAGE_CHARS: usize = 2000;
+
 /// Continuation cue appended (as `system`) after a truncated turn so the
 /// next request deterministically asks for the rest instead of repeating
 /// the same truncated prefix.
 const CONTINUE_CUE: &str = "Continue.";
+
+/// Instruction framing every compaction summary request.
+const SUMMARIZE_SYSTEM: &str = "You are a precise session summarizer for a coding assistant. Summarize the numbered conversation below into a short paragraph preserving: the user's goal, key decisions, and any facts needed to continue the work. Omit chit-chat.";
+
+/// Interaction mode. One shared agent implementation serves both modes;
+/// the mode travels with the session and is stamped into every result.
+///
+/// Plan mode must not perform mutations. No mutating capability exists yet
+/// (tools arrive in Phase 4+), so the enforcement point is
+/// [`Mode::allows_mutation`]: every future tool call must check it before
+/// acting, and review must verify that gate rather than trusting callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    /// Normal operation (may mutate once tools exist).
+    #[default]
+    Build,
+    /// Planning only: reason and propose, never mutate.
+    Plan,
+}
+
+impl Mode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Build => "build",
+            Mode::Plan => "plan",
+        }
+    }
+
+    /// Raw-Tab and `/plan`–`/build` toggle through this.
+    pub fn toggle(self) -> Self {
+        match self {
+            Mode::Build => Mode::Plan,
+            Mode::Plan => Mode::Build,
+        }
+    }
+
+    /// Whether side-effecting operations are permitted in this mode.
+    /// Phase 5+ tool implementations MUST consult this before mutating.
+    pub fn allows_mutation(self) -> bool {
+        match self {
+            Mode::Build => true,
+            Mode::Plan => false,
+        }
+    }
+}
+
+impl std::fmt::Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentConfig {
@@ -41,15 +99,20 @@ impl Default for AgentConfig {
 
 /// In-memory conversation history for one agent session. No persistence
 /// (sessions are Phase 8); dropped with the process.
+///
+/// Also carries the interaction [`Mode`]: `/new` (via [`AgentSession::clear`])
+/// resets history but preserves the mode.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct AgentSession {
     history: Vec<Message>,
+    mode: Mode,
 }
 
 impl AgentSession {
     pub fn new() -> Self {
         AgentSession {
             history: Vec::new(),
+            mode: Mode::default(),
         }
     }
 
@@ -61,19 +124,30 @@ impl AgentSession {
         self.history.push(message);
     }
 
+    /// Drop history but keep the interaction mode.
     pub fn clear(&mut self) {
         self.history.clear();
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
     }
 }
 
 /// Combined result of one [`Agent::run`]: assistant text accumulated across
-/// every iteration, how many provider calls that took, and trailing metadata.
+/// every iteration, how many provider calls that took, trailing metadata,
+/// and the [`Mode`] that produced it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AgentResult {
     pub content: String,
     pub iterations: u32,
     pub finish_reason: Option<FinishReason>,
     pub usage: Option<Usage>,
+    pub mode: Mode,
 }
 
 /// How one [`Agent::run`] ended. Every variant carries what was produced so
@@ -103,6 +177,14 @@ impl AgentOutcome {
             AgentOutcome::ProviderError { partial, .. } => partial,
         }
     }
+}
+
+/// What one [`Agent::compact`] did, for honest user-facing reporting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactReport {
+    pub messages_before: usize,
+    pub messages_after: usize,
+    pub summary_chars: usize,
 }
 
 /// A bounded run driver over any [`ModelProvider`].
@@ -150,7 +232,10 @@ impl<P: ModelProvider> Agent<P> {
         cancel: Option<&CancelFlag>,
         on_event: &mut dyn FnMut(StreamEvent) -> StreamControl,
     ) -> AgentOutcome {
-        let mut result = AgentResult::default();
+        let mut result = AgentResult {
+            mode: session.mode(),
+            ..AgentResult::default()
+        };
         if user_input.trim().is_empty() {
             return AgentOutcome::ProviderError {
                 error: ProviderError::InvalidConfig(
@@ -216,6 +301,104 @@ impl<P: ModelProvider> Agent<P> {
                 _ => return AgentOutcome::Completed(result),
             }
         }
+    }
+
+    /// Answer a side question without touching `session`: the run executes
+    /// against a private clone (current history as read-only context) which
+    /// is discarded afterwards. Mode, history, and totals of the main
+    /// session are unchanged; the caller prints the returned outcome.
+    pub fn run_btw(
+        &self,
+        session: &AgentSession,
+        question: &str,
+        cancel: Option<&CancelFlag>,
+        on_event: &mut dyn FnMut(StreamEvent) -> StreamControl,
+    ) -> AgentOutcome {
+        let mut scratch = session.clone();
+        self.run(&mut scratch, question, cancel, on_event)
+    }
+
+    /// Whether `session` has grown past the auto-compaction threshold.
+    pub fn needs_compaction(session: &AgentSession) -> bool {
+        session.history.len() > COMPACT_AT_MESSAGES
+    }
+
+    /// Compact `session` when `auto` is enabled and the threshold is passed;
+    /// otherwise do nothing. Returns the report when compaction ran.
+    pub fn maybe_auto_compact(
+        &self,
+        session: &mut AgentSession,
+        auto: bool,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Option<CompactReport>, ProviderError> {
+        if auto && Self::needs_compaction(session) {
+            self.compact(session, cancel).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Replace all but the newest [`COMPACT_KEEP_MESSAGES`] messages with a
+    /// single `system` summary produced through the model layer (one
+    /// non-streaming call — no summarization framework, just a provider
+    /// request). Histories at or below the keep window are left alone and
+    /// reported unchanged, without spending a request.
+    pub fn compact(
+        &self,
+        session: &mut AgentSession,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<CompactReport, ProviderError> {
+        let before = session.history.len();
+        if before <= COMPACT_KEEP_MESSAGES {
+            return Ok(CompactReport {
+                messages_before: before,
+                messages_after: before,
+                summary_chars: 0,
+            });
+        }
+        let split = before - COMPACT_KEEP_MESSAGES;
+        let mut transcript = String::new();
+        // Role labels use Debug introspection, not wire spellings (those
+        // belong to providers): the transcript is prompt text, not protocol.
+        for (i, message) in session.history[..split].iter().enumerate() {
+            transcript.push_str(&format!(
+                "{}. [{:?}] {}\n",
+                i + 1,
+                message.role,
+                message.content
+            ));
+        }
+        // Bound the summary request: transcript already shrinks with every
+        // compaction, and each message is capped for the request.
+        let transcript: String = transcript
+            .lines()
+            .map(|line| {
+                if line.chars().count() > COMPACT_MESSAGE_CHARS {
+                    let clipped: String = line.chars().take(COMPACT_MESSAGE_CHARS).collect();
+                    format!("{clipped}…[truncated]")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let request = ChatRequest {
+            messages: vec![Message::system(SUMMARIZE_SYSTEM), Message::user(transcript)],
+            stream: false,
+            cancel: cancel.cloned(),
+        };
+        let response = self.provider.chat(&request)?;
+        let summary = format!("Session summary: {}", response.content.trim());
+        let summary_chars = summary.chars().count();
+        let mut kept = session.history[split..].to_vec();
+        let mut history = vec![Message::system(summary)];
+        history.append(&mut kept);
+        session.history = history;
+        Ok(CompactReport {
+            messages_before: before,
+            messages_after: session.history.len(),
+            summary_chars,
+        })
     }
 }
 
@@ -675,5 +858,151 @@ mod tests {
         assert_eq!(session.history().len(), 2);
         session.clear();
         assert!(session.history().is_empty());
+    }
+
+    #[test]
+    fn mode_defaults_toggle_and_gates() {
+        assert_eq!(Mode::default(), Mode::Build);
+        assert_eq!(Mode::Build.toggle(), Mode::Plan);
+        assert_eq!(Mode::Plan.toggle(), Mode::Build);
+        assert!(Mode::Build.allows_mutation());
+        assert!(!Mode::Plan.allows_mutation());
+        assert_eq!(Mode::Plan.as_str(), "plan");
+        let mut session = AgentSession::new();
+        assert_eq!(session.mode(), Mode::Build);
+        session.set_mode(Mode::Plan);
+        assert_eq!(session.mode(), Mode::Plan);
+        session.clear();
+        assert_eq!(session.mode(), Mode::Plan, "clear keeps the mode");
+    }
+
+    #[test]
+    fn result_stamps_session_mode() {
+        let (agent, mut session) = agent(vec![ScriptedProvider::reply(
+            "done",
+            Some(FinishReason::Stop),
+        )]);
+        session.set_mode(Mode::Plan);
+        let outcome = agent.run(&mut session, "hi", None, &mut sink());
+        assert_eq!(outcome.result().mode, Mode::Plan);
+    }
+
+    fn history_with_pairs(n: usize) -> AgentSession {
+        let mut session = AgentSession::new();
+        for i in 0..n {
+            session.push(Message::user(format!("q{i}")));
+            session.push(Message::assistant(format!("a{i}")));
+        }
+        session
+    }
+
+    #[test]
+    fn compact_replaces_prefix_with_summary() {
+        // 12 messages: 8 summarized, last 4 kept.
+        let provider = ScriptedProvider::new(vec![ScriptedProvider::reply(
+            "SUMMARY",
+            Some(FinishReason::Stop),
+        )]);
+        let agent = Agent::new(provider, AgentConfig::default()).expect("valid");
+        let mut session = history_with_pairs(6);
+        let report = agent.compact(&mut session, None).expect("compact");
+        assert_eq!(report.messages_before, 12);
+        assert_eq!(report.messages_after, 5);
+        assert!(report.summary_chars > 0);
+        assert_eq!(session.history().len(), 5);
+        assert_eq!(session.history()[0].role, crate::Role::System);
+        assert!(session.history()[0]
+            .content
+            .starts_with("Session summary: SUMMARY"));
+        // Last 4 verbatim (q4/a4, q5/a5).
+        assert_eq!(session.history()[1].content, "q4");
+        assert_eq!(session.history()[4].content, "a5");
+        assert_eq!(agent.provider().calls.get(), 1);
+    }
+
+    #[test]
+    fn compact_small_history_is_noop_without_provider_call() {
+        // Empty script: any provider call would panic the test.
+        let provider = ScriptedProvider::new(vec![]);
+        let agent = Agent::new(provider, AgentConfig::default()).expect("valid");
+        let mut session = history_with_pairs(2);
+        let report = agent.compact(&mut session, None).expect("compact");
+        assert_eq!(report.messages_before, 4);
+        assert_eq!(report.messages_after, 4);
+        assert_eq!(report.summary_chars, 0);
+        assert_eq!(agent.provider().calls.get(), 0);
+    }
+
+    #[test]
+    fn auto_compaction_threshold_and_bypass() {
+        assert!(!Agent::<ScriptedProvider>::needs_compaction(
+            &history_with_pairs(10)
+        ));
+        assert!(Agent::<ScriptedProvider>::needs_compaction(
+            &history_with_pairs(11)
+        ));
+
+        // Disabled: no call even above threshold (empty script proves it).
+        let provider = ScriptedProvider::new(vec![]);
+        let agent = Agent::new(provider, AgentConfig::default()).expect("valid");
+        let mut session = history_with_pairs(11);
+        assert_eq!(
+            agent
+                .maybe_auto_compact(&mut session, false, None)
+                .expect("skip"),
+            None
+        );
+        assert_eq!(agent.provider().calls.get(), 0);
+
+        // Enabled: compacts (22 messages -> 1 summary + 4 kept).
+        let provider = ScriptedProvider::new(vec![ScriptedProvider::reply(
+            "AUTO",
+            Some(FinishReason::Stop),
+        )]);
+        let agent = Agent::new(provider, AgentConfig::default()).expect("valid");
+        let report = agent
+            .maybe_auto_compact(&mut session, true, None)
+            .expect("compact")
+            .expect("report");
+        assert_eq!(report.messages_before, 22);
+        assert_eq!(report.messages_after, 5);
+        assert_eq!(session.history().len(), 5);
+    }
+
+    #[test]
+    fn compact_cancel_leaves_history_untouched() {
+        let provider = ScriptedProvider::new(vec![ScriptedProvider::reply(
+            "SUMMARY",
+            Some(FinishReason::Stop),
+        )]);
+        let agent = Agent::new(provider, AgentConfig::default()).expect("valid");
+        let mut session = history_with_pairs(11);
+        let err = agent
+            .compact(&mut session, Some(&CancelFlag::cancelled()))
+            .expect_err("cancelled compaction must fail");
+        assert!(matches!(err, ProviderError::Cancelled));
+        assert_eq!(session.history().len(), 22, "history untouched");
+    }
+
+    #[test]
+    fn btw_leaves_main_session_untouched() {
+        let (agent, mut session) = agent(vec![
+            ScriptedProvider::reply("main-answer", Some(FinishReason::Stop)),
+            ScriptedProvider::reply("side-answer", Some(FinishReason::Stop)),
+        ]);
+        agent.run(&mut session, "main task", None, &mut sink());
+        assert_eq!(session.history().len(), 2);
+        session.set_mode(Mode::Plan);
+
+        let outcome = agent.run_btw(&session, "side question", None, &mut sink());
+        let AgentOutcome::Completed(result) = outcome else {
+            panic!("expected side answer, got {outcome:?}");
+        };
+        assert_eq!(result.content, "side-answer");
+        // Main session byte-identical: 2 messages, mode preserved.
+        assert_eq!(session.history().len(), 2);
+        assert_eq!(session.history()[1].content, "main-answer");
+        assert_eq!(session.mode(), Mode::Plan);
+        assert_eq!(agent.provider().calls.get(), 2);
     }
 }
