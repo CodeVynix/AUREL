@@ -4,6 +4,7 @@ members = [
     "crates/aurel-core",
     "crates/aurel-config",
     "crates/aurel-model",
+    "crates/aurel-tools",
     "crates/aurel-cli",
 ]
 
