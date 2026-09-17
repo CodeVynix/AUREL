@@ -91,37 +91,56 @@ full response.
 - **Timeout:** `timeout_secs` (minimum 1s) is the total budget per attempt,
   streams included — the same semantic as common HTTP clients. Slow but
   healthy long generations may need a raise; that is explicit, not a bug.
-- **Retries:** bounded (`max_retries`, clamped to 5) with linear backoff,
-  and only for transient classes — connection/timeout/rate-limit/5xx (plus
-  408/425). Authentication, configuration, malformed, empty, and most 4xx
-  failures never retry. A stream that already delivered content never
-  retries (partial text must not repeat).
-- **Cancellation:** cooperative via `CancelFlag`, checked between attempts
-  and before every streamed chunk, plus a per-chunk consumer verdict.
-  `aurel chat` itself relies on the timeout and normal process termination;
-  the flag exists for the future agent loop.
+- **Retries:** bounded (`max_retries`, clamped to 5) with linear backoff
+  (`250ms × attempt`, capped at 5s), and only for transient classes —
+  connection/timeout/rate-limit/5xx (plus 408/425). Authentication,
+  configuration, malformed, empty, and most 4xx failures never retry.
+  A stream that already delivered user-visible content never retries
+  (partial text must not print twice); failures before the first delta may
+  retry normally. Retry state is explicit delivery tracking, never inferred
+  from the error variant.
+- **Retry-After:** a numeric delta-seconds `Retry-After` on 429 raises the
+  backoff for that retry (still capped at 5s; a zero hint falls back to the
+  base backoff). HTTP-date form is not parsed and falls back to base
+  backoff. A server hint can never extend a wait past the cap.
+- **Cancellation:** cooperative via `CancelFlag`, checked between attempts,
+  throughout backoff waits (10ms quanta — a cancelled backoff aborts
+  promptly instead of sleeping it out), and before every streamed chunk,
+  plus a per-chunk consumer verdict. Limitation, stated plainly: a read
+  already blocked inside the OS socket still waits out the transport's
+  overall timeout — single-threaded synchronous code cannot preempt it
+  without threads or async, which Core deliberately avoids. In every other
+  position cancellation is prompt. `aurel chat` itself relies on the
+  timeout and normal process termination; the flag exists for the future
+  agent loop.
 
 ## Errors
 
 Typed `ProviderError`s with clean messages: invalid config/endpoint,
 connection failure, timeout, cancellation, HTTP status (with the server's
-`error.message` extracted when present, bounded to 500 chars), auth
-rejection (401/403/407 — never the credential), rate limits (with the
-`Retry-After` hint when the server sends one), malformed/empty responses,
-stream failures, unsupported capabilities. Malformed input never panics and
-never loops: one parse attempt, one typed error. Response bodies are
-size-bounded before reading (8 MiB success, 64 KiB error diagnostics,
-8 MiB streamed accumulation).
+`error.message` extracted when present, bounded to 500 chars and scrubbed
+of the credential), auth rejection (401/403/407 — never the credential),
+rate limits (with the numeric `Retry-After` hint when the server sends
+one), malformed/empty responses, stream failures, unsupported
+capabilities. Malformed input never panics and never loops: one parse
+attempt, one typed error. Response bodies are size-bounded before reading
+(8 MiB success, 64 KiB error diagnostics, 8 MiB streamed accumulation,
+1 MiB per SSE line enforced during reading).
 
 ## Security and redaction
 
 - `aurel config show` prints `api_key = "<redacted>"` (or `"<unset>"`);
   the real value is never printed, including in `Debug` formatting of
   configuration and provider structs (regression-tested).
-- API keys never appear in logs, diagnostics, or error messages. There is
-  deliberately **no `--api-key` flag**: argv leaks into shell history and
-  process listings. Use a config file (permissions `0600`-style care apply
-  as with any secret file) or `AUREL_API_KEY`.
+- API keys never appear in logs, diagnostics, or error messages. Every
+  server-controlled diagnostic (HTTP error bodies, malformed-response and
+  malformed-chunk details) is scrubbed of the configured credential — both
+  the bare key and the `Bearer <key>` form — before it can reach a
+  `ProviderError`, replacing before length-bounding so a key straddling
+  the clip boundary cannot leak partially. There is deliberately **no
+  `--api-key` flag**: argv leaks into shell history and process listings.
+  Use a config file (permissions `0600`-style care apply as with any
+  secret file) or `AUREL_API_KEY`.
 - A malformed config file can echo the offending line in its parse error;
   since a real key is always a TOML string (which parses cleanly), key
   material cannot surface that way — wrong-type errors only echo

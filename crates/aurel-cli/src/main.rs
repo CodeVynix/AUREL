@@ -429,7 +429,11 @@ fn chat_with_provider(
         let mut write_failed = false;
         let result = provider.chat_stream(&request, &mut |event: StreamEvent| {
             if !write_failed && (write!(out, "{}", event.delta).is_err() || out.flush().is_err()) {
+                // Stop consuming: without a working sink the rest of the
+                // stream is worthless, and continuing would only waste time
+                // and risk duplicate output on any retry.
                 write_failed = true;
+                return StreamControl::Cancel;
             }
             StreamControl::Continue
         });
@@ -443,7 +447,13 @@ fn chat_with_provider(
                 }
             }
             Err(e) => {
-                let _ = writeln!(err, "{e}");
+                // A write failure cancels the stream on purpose (see above):
+                // report the real cause, not a misleading cancellation.
+                if write_failed {
+                    let _ = writeln!(err, "error: failed to write model output");
+                } else {
+                    let _ = writeln!(err, "{e}");
+                }
                 EXIT_RUNTIME_ERROR
             }
         }
@@ -843,6 +853,90 @@ mod tests {
         assert_eq!(code, EXIT_RUNTIME_ERROR);
         let err = String::from_utf8(err).expect("utf8");
         assert!(err.contains("rejected the credentials"), "got: {err:?}");
+    }
+
+    /// A writer that accepts exactly one write, then fails every write.
+    struct FailAfterFirst {
+        writes: std::cell::Cell<usize>,
+    }
+
+    impl Write for FailAfterFirst {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes.set(self.writes.get() + 1);
+            if self.writes.get() > 1 {
+                Err(std::io::Error::other("sink is broken"))
+            } else {
+                Ok(buf.len())
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A provider offering far more deltas than the test will consume.
+    struct ManyDeltas {
+        offered: std::cell::Cell<usize>,
+    }
+
+    impl ModelProvider for ManyDeltas {
+        fn name(&self) -> &'static str {
+            "many"
+        }
+
+        fn capabilities(&self) -> aurel_model::Capabilities {
+            aurel_model::Capabilities {
+                streaming: true,
+                tool_calling: false,
+                structured_output: false,
+                context_window: None,
+            }
+        }
+
+        fn chat(
+            &self,
+            _request: &aurel_model::ChatRequest,
+        ) -> Result<aurel_model::ChatResponse, aurel_model::ProviderError> {
+            Ok(fake_response())
+        }
+
+        fn chat_stream(
+            &self,
+            _request: &aurel_model::ChatRequest,
+            on_event: &mut dyn FnMut(StreamEvent) -> StreamControl,
+        ) -> Result<aurel_model::ChatResponse, aurel_model::ProviderError> {
+            for i in 0..10 {
+                self.offered.set(self.offered.get() + 1);
+                if on_event(StreamEvent {
+                    delta: format!("d{i}"),
+                }) == StreamControl::Cancel
+                {
+                    return Err(aurel_model::ProviderError::Cancelled);
+                }
+            }
+            Ok(fake_response())
+        }
+    }
+
+    #[test]
+    fn chat_stops_consuming_when_stdout_fails() {
+        let provider = ManyDeltas {
+            offered: std::cell::Cell::new(0),
+        };
+        let mut out = FailAfterFirst {
+            writes: std::cell::Cell::new(0),
+        };
+        let mut err = Vec::new();
+        let code = chat_with_provider("hi", true, &provider, &mut out, &mut err);
+        assert_eq!(code, EXIT_RUNTIME_ERROR);
+        assert!(
+            provider.offered.get() < 10,
+            "must stop early instead of draining the stream (offered {})",
+            provider.offered.get()
+        );
+        let err = String::from_utf8(err).expect("utf8");
+        assert!(err.contains("failed to write model output"), "got: {err:?}");
     }
 
     #[test]
