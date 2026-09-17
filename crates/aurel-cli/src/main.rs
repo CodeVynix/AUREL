@@ -607,6 +607,23 @@ fn execute_agent(
             return EXIT_RUNTIME_ERROR;
         }
     };
+    run_agent(&agent, message, out, err)
+}
+
+/// Drive one agent run against any provider and print the outcome.
+/// Split from [`execute_agent`] so streaming output failures are testable
+/// without network access.
+///
+/// A failed stdout write cancels the turn on purpose (see [`StreamSink`]):
+/// such outcomes report the write failure, matching the Phase 2 `chat`
+/// behavior, instead of a misleading cancellation or provider error.
+fn run_agent<P: ModelProvider>(
+    agent: &Agent<P>,
+    message: &str,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    let streaming = agent.config().streaming;
     let cancel = CancelFlag::new();
     let mut session = AgentSession::new();
     let mut sink = StreamSink::new(out);
@@ -617,7 +634,7 @@ fn execute_agent(
     let out = sink.out;
     match outcome {
         AgentOutcome::Completed(result) => {
-            if cfg.model.streaming {
+            if streaming {
                 let _ = writeln!(out);
             } else if writeln!(out, "{}", result.content).is_err() {
                 return 1;
@@ -629,7 +646,7 @@ fn execute_agent(
             }
         }
         AgentOutcome::IterationLimitReached(result) => {
-            if !cfg.model.streaming {
+            if !streaming {
                 let _ = writeln!(out, "{}", result.content);
             } else {
                 let _ = writeln!(out);
@@ -642,11 +659,19 @@ fn execute_agent(
             EXIT_RUNTIME_ERROR
         }
         AgentOutcome::Cancelled(_) => {
-            let _ = writeln!(err, "error: agent run cancelled");
+            if failed {
+                let _ = writeln!(err, "error: failed to write model output");
+            } else {
+                let _ = writeln!(err, "error: agent run cancelled");
+            }
             EXIT_RUNTIME_ERROR
         }
         AgentOutcome::ProviderError { error, .. } => {
-            let _ = writeln!(err, "{error}");
+            if failed {
+                let _ = writeln!(err, "error: failed to write model output");
+            } else {
+                let _ = writeln!(err, "{error}");
+            }
             EXIT_RUNTIME_ERROR
         }
     }
@@ -1115,6 +1140,38 @@ mod tests {
         );
         let err = String::from_utf8(err).expect("utf8");
         assert!(err.contains("failed to write model output"), "got: {err:?}");
+    }
+
+    #[test]
+    fn agent_reports_write_failure_not_cancellation() {
+        // Same broken-sink setup through the agent path: the provider sees
+        // our Cancel verdict and reports Cancelled, but the user must see
+        // the write failure — matching `chat` behavior.
+        let provider = ManyDeltas {
+            offered: std::cell::Cell::new(0),
+        };
+        let agent = Agent::new(
+            provider,
+            AgentConfig {
+                max_iterations: 5,
+                streaming: true,
+            },
+        )
+        .expect("valid config");
+        let mut out = FailAfterFirst {
+            writes: std::cell::Cell::new(0),
+        };
+        let mut err = Vec::new();
+        let code = run_agent(&agent, "hi", &mut out, &mut err);
+        assert_eq!(code, EXIT_RUNTIME_ERROR);
+        assert!(
+            agent.provider().offered.get() < 10,
+            "must stop early instead of draining the stream (offered {})",
+            agent.provider().offered.get()
+        );
+        let err = String::from_utf8(err).expect("utf8");
+        assert!(err.contains("failed to write model output"), "got: {err:?}");
+        assert!(!err.contains("cancelled"), "must not misreport: {err:?}");
     }
 
     #[test]

@@ -133,8 +133,16 @@ impl<P: ModelProvider> Agent<P> {
     /// append, and continue-on-truncation until done, limited, cancelled,
     /// or failed. Appends every exchanged message to `session`.
     ///
-    /// `cancel` is threaded into each provider request (Phase 2 mechanism);
-    /// `on_event` receives streamed deltas in order and may cancel the turn.
+    /// `cancel` is checked explicitly before every provider call and
+    /// threaded into each request (Phase 2 mechanism); `on_event` receives
+    /// streamed deltas in order and may cancel the turn.
+    ///
+    /// Partial output is preserved: streamed deltas are intercepted as they
+    /// pass through, so when a turn delivers content and then fails
+    /// (cancellation or provider error), the outcome still carries that
+    /// content, the call counts as an iteration, and the partial assistant
+    /// message joins the session. Failures before any delivery leave the
+    /// accumulated result untouched.
     pub fn run(
         &self,
         session: &mut AgentSession,
@@ -157,23 +165,42 @@ impl<P: ModelProvider> Agent<P> {
             if result.iterations >= self.config.max_iterations {
                 return AgentOutcome::IterationLimitReached(result);
             }
+            // Explicit agent-side cancellation, independent of whether the
+            // provider itself honors the flag.
+            if cancel.as_ref().is_some_and(|flag| flag.is_cancelled()) {
+                return AgentOutcome::Cancelled(result);
+            }
             let request = ChatRequest {
                 messages: session.history.clone(),
                 stream: self.config.streaming,
                 cancel: cancel.cloned(),
             };
+            // Capture what the user already saw: on a failed turn the
+            // buffer below is what gets preserved.
+            let mut turn_text = String::new();
             let response = if self.config.streaming {
-                self.provider.chat_stream(&request, on_event)
+                let mut capture = |event: StreamEvent| {
+                    turn_text.push_str(&event.delta);
+                    on_event(event)
+                };
+                self.provider.chat_stream(&request, &mut capture)
             } else {
                 self.provider.chat(&request)
             };
             let response = match response {
                 Ok(response) => response,
-                Err(ProviderError::Cancelled) => return AgentOutcome::Cancelled(result),
                 Err(error) => {
-                    return AgentOutcome::ProviderError {
-                        error,
-                        partial: result,
+                    if !turn_text.is_empty() {
+                        result.iterations += 1;
+                        result.content.push_str(&turn_text);
+                        session.push(Message::assistant(turn_text));
+                    }
+                    return match error {
+                        ProviderError::Cancelled => AgentOutcome::Cancelled(result),
+                        error => AgentOutcome::ProviderError {
+                            error,
+                            partial: result,
+                        },
                     };
                 }
             };
@@ -459,14 +486,159 @@ mod tests {
     }
 
     #[test]
-    fn consumer_cancel_verdict_cancels() {
+    fn consumer_cancel_verdict_cancels_with_partial_preserved() {
+        // The consumer saw "done" before cancelling, so the outcome keeps
+        // that content and counts the call that produced it.
         let (agent, mut session) = agent(vec![ScriptedProvider::reply(
             "done",
             Some(FinishReason::Stop),
         )]);
         let outcome = agent.run(&mut session, "hi", None, &mut |_| StreamControl::Cancel);
+        let AgentOutcome::Cancelled(result) = outcome else {
+            panic!("expected cancellation, got {outcome:?}");
+        };
+        assert_eq!(result.content, "done");
+        assert_eq!(result.iterations, 1);
+        assert_eq!(session.history().len(), 2);
+        assert_eq!(session.history()[1].content, "done");
+    }
+
+    /// Provider double that delivers one delta and then fails, exercising
+    /// the partial-preservation path for any error kind.
+    struct DeliverThenFail {
+        calls: Cell<usize>,
+        error: ProviderError,
+    }
+
+    impl ModelProvider for DeliverThenFail {
+        fn name(&self) -> &'static str {
+            "deliver-then-fail"
+        }
+
+        fn capabilities(&self) -> crate::Capabilities {
+            crate::Capabilities {
+                streaming: true,
+                tool_calling: false,
+                structured_output: false,
+                context_window: None,
+            }
+        }
+
+        fn chat(&self, _request: &ChatRequest) -> Result<ChatResponse, ProviderError> {
+            self.calls.set(self.calls.get() + 1);
+            Err(self.error.clone())
+        }
+
+        fn chat_stream(
+            &self,
+            _request: &ChatRequest,
+            on_event: &mut dyn FnMut(StreamEvent) -> StreamControl,
+        ) -> Result<ChatResponse, ProviderError> {
+            self.calls.set(self.calls.get() + 1);
+            on_event(StreamEvent {
+                delta: "part-".to_string(),
+            });
+            Err(self.error.clone())
+        }
+    }
+
+    #[test]
+    fn cancelled_after_delivery_preserves_partial() {
+        let provider = DeliverThenFail {
+            calls: Cell::new(0),
+            error: ProviderError::Cancelled,
+        };
+        let agent = Agent::new(provider, AgentConfig::default()).expect("valid config");
+        let mut session = AgentSession::new();
+        let outcome = agent.run(&mut session, "hi", None, &mut sink());
+        let AgentOutcome::Cancelled(result) = outcome else {
+            panic!("expected cancellation, got {outcome:?}");
+        };
+        assert_eq!(result.content, "part-");
+        assert_eq!(result.iterations, 1);
+        assert_eq!(agent.provider().calls.get(), 1);
+        assert_eq!(session.history().len(), 2);
+        assert_eq!(session.history()[1].content, "part-");
+        assert_eq!(session.history()[1].role, crate::Role::Assistant);
+    }
+
+    #[test]
+    fn provider_error_after_delivery_preserves_partial() {
+        let provider = DeliverThenFail {
+            calls: Cell::new(0),
+            error: ProviderError::Timeout("slow".into()),
+        };
+        let agent = Agent::new(provider, AgentConfig::default()).expect("valid config");
+        let mut session = AgentSession::new();
+        let outcome = agent.run(&mut session, "hi", None, &mut sink());
+        let AgentOutcome::ProviderError { error, partial } = outcome else {
+            panic!("expected provider error, got {outcome:?}");
+        };
+        assert!(matches!(error, ProviderError::Timeout(_)));
+        assert_eq!(partial.content, "part-");
+        assert_eq!(partial.iterations, 1);
+        assert_eq!(session.history().len(), 2);
+        assert_eq!(session.history()[1].content, "part-");
+    }
+
+    /// Provider double that ignores cancellation entirely: always succeeds.
+    /// Proves the agent-side pre-iteration check works on its own.
+    struct DeafProvider {
+        calls: Cell<usize>,
+    }
+
+    impl ModelProvider for DeafProvider {
+        fn name(&self) -> &'static str {
+            "deaf"
+        }
+
+        fn capabilities(&self) -> crate::Capabilities {
+            crate::Capabilities {
+                streaming: true,
+                tool_calling: false,
+                structured_output: false,
+                context_window: None,
+            }
+        }
+
+        fn chat(&self, _request: &ChatRequest) -> Result<ChatResponse, ProviderError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(ChatResponse {
+                content: "done".to_string(),
+                role: crate::Role::Assistant,
+                model: "deaf".to_string(),
+                finish_reason: Some(FinishReason::Stop),
+                usage: None,
+            })
+        }
+
+        fn chat_stream(
+            &self,
+            request: &ChatRequest,
+            _on_event: &mut dyn FnMut(StreamEvent) -> StreamControl,
+        ) -> Result<ChatResponse, ProviderError> {
+            self.chat(request)
+        }
+    }
+
+    #[test]
+    fn agent_side_check_cancels_despite_deaf_provider() {
+        let provider = DeafProvider {
+            calls: Cell::new(0),
+        };
+        let agent = Agent::new(provider, AgentConfig::default()).expect("valid config");
+        let mut session = AgentSession::new();
+        let outcome = agent.run(
+            &mut session,
+            "hi",
+            Some(&CancelFlag::cancelled()),
+            &mut sink(),
+        );
         assert!(matches!(outcome, AgentOutcome::Cancelled(_)));
         assert_eq!(outcome.result().iterations, 0);
+        // No provider call happened; only the user message was recorded.
+        assert_eq!(agent.provider().calls.get(), 0);
+        assert_eq!(session.history().len(), 1);
     }
 
     #[test]
