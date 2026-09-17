@@ -1,6 +1,6 @@
-# AUREL Architecture — Phase 2
+# AUREL Architecture — Phase 3
 
-This document describes what Phase 2 actually contains. Nothing more.
+This document describes what Phase 3 actually contains. Nothing more.
 
 ## Workspace
 
@@ -19,8 +19,9 @@ display (`aurel_core::version()`), and the test expectations:
   with API-key redaction.
 - `crates/aurel-model` — library crate (`aurel_model`). The
   provider-agnostic abstraction (`Message`, `ChatRequest`, `ChatResponse`,
-  `Capabilities`, `ProviderError`, `ModelProvider` trait) plus the
-  OpenAI-compatible provider. Owns the HTTP/TLS/JSON dependencies (see
+  `Capabilities`, `ProviderError`, `ModelProvider` trait), the
+  OpenAI-compatible provider, and the basic agent loop (`Agent`,
+  `AgentSession`, `AgentOutcome`). Owns the HTTP/TLS/JSON dependencies (see
   ADR-0006); nothing else in the workspace touches the network.
 - `crates/aurel-cli` — binary crate producing the `aurel` binary
   (`[[bin]] name = "aurel"`). Depends on all three libraries via local path
@@ -50,6 +51,9 @@ isolated temp homes and working directories:
 - `chat [MESSAGE]...` → one model exchange, reply to stdout, exit 0
   (piped stdin when omitted; terminal without message is exit 2)
 - `chat --help` → command help, exit 0
+- `agent [MESSAGE]...` → one bounded run, reply to stdout, exit 0
+  (same message acquisition as `chat`)
+- `agent --help` → command help, exit 0
 - unknown flags/commands, bad values, `--version` + command → stderr, exit 2
   (usage errors take precedence over `--help`: help prints only when the
   surrounding command line is valid)
@@ -73,10 +77,24 @@ building from repositories, no tool calls, no follow-up turns: strictly
 one exchange. Details live in `docs/model-providers.md`, the normative
 reference for provider behavior, errors, retries, and secrets.
 
+## Agent loop
+
+`aurel agent` runs one bounded turn sequence through `Agent<P:
+ModelProvider>` with a fresh in-memory `AgentSession`: push the user
+message, request, append the reply, and — only for truncated (`length`)
+turns — append a `system` "Continue." cue and request again, up to
+`max_iterations` (default 5, hard cap 100). Outcomes are explicit:
+`Completed`, `IterationLimitReached` (partial work kept, exit 1 with a
+warning), `Cancelled`, and `ProviderError` — each carrying accumulated
+content, call count, and summed usage. Cancellation reuses the Phase 2
+`CancelFlag`. There are no tools: the loop cannot inspect, edit, or run
+anything (that is Phase 4+).
+
 ## Configuration
 
-`log_level` plus the `[model]` table (`name`, `base_url`, optional
-`api_key`, `timeout_secs`, `max_retries`, `streaming`), all through the
+`log_level`, the `[model]` table (`name`, `base_url`, optional
+`api_key`, `timeout_secs`, `max_retries`, `streaming`), and the `[agent]`
+table (`max_iterations`), all through the
 same precedence machinery: defaults < global file < project file < env <
 CLI, plus `--config` replacing discovery. Files are TOML parsed with
 unknown-field rejection; missing files are skipped except an explicit
@@ -166,3 +184,14 @@ change; the parser, config machinery, and `chat` dispatch added none.
 - AUREL process resources vs model-server resources are measured
   separately: this baseline covers the AUREL binary only. A local model's
   gigabytes are the server's, never attributed to AUREL.
+
+## Phase 3 delta (measured, informational)
+
+Same host and caveats as above. No new dependencies and no new crates —
+one module (`aurel-model/src/agent.rs`), config keys, and CLI wiring.
+
+- Release binary: 2,871,296 bytes (≈2.74 MiB), i.e. +37,376 bytes
+  (+1.3%) vs Phase 2. Still far under the < 15 MB Core target.
+- Startup, warm process start-to-exit: release `--version` ≈20–25 ms —
+  unchanged; the loop builds per `agent` invocation and costs nothing
+  at startup.

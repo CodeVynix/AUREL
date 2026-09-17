@@ -1,4 +1,4 @@
-# AUREL Configuration — Phase 2
+# AUREL Configuration — Phase 3
 
 TOML configuration with deterministic precedence. Only settings actually
 needed at this stage exist; the schema grows in later phases.
@@ -41,6 +41,16 @@ never printed, logged, or embedded in errors.
 
 Unknown keys are rejected (`deny_unknown_fields`) so typos fail loudly.
 
+## Agent settings (`[agent]`)
+
+| Key | Type | Default | Sources |
+| --- | ---- | ------- | ------- |
+| `max_iterations` | integer | `5` | file, `AUREL_MAX_ITERATIONS`, `--max-iterations` |
+
+Bounds one `aurel agent` run to that many provider calls. Values above 100
+are rejected by the loop with a clean error; `0` is rejected by the CLI
+flag parser (exit 2) and by the loop (exit 1) alike.
+
 ## Precedence
 
 ```text
@@ -65,8 +75,8 @@ CLI arguments
   non-Unicode keys are ignored (recognized names are pure ASCII), values
   are lossy-converted and flow into normal validation (a bad value is exit
   1, never a panic).
-- **CLI:** `--log-level <level>`, `--model`, `--base-url`, `--streaming`
-  override everything in their area.
+- **CLI:** `--log-level <level>`, `--model`, `--base-url`, `--streaming`,
+  `--max-iterations` override everything in their area.
 - Missing files are skipped silently. `--config <path>` replaces file
   discovery: only that file is read (plus env and CLI above it); a missing
   `--config` file is an error.
@@ -81,14 +91,16 @@ OPTIONS:
     -V, --version           Print version (never reads config files)
         --config <path>     Use this file instead of discovered files
         --log-level <level> error|warn|info|debug|trace
-        --model <name>      Model id for `chat`
-        --base-url <url>    Endpoint root for `chat`
+        --model <name>      Model id for `chat` / `agent`
+        --base-url <url>    Endpoint root for `chat` / `agent`
         --streaming <bool>  true|false
+        --max-iterations <n> 1-100 agent loop bound for `agent`
 
 COMMANDS:
     config show    Print the effective configuration
     config         Print the `config` command help (same as `config --help`)
     chat [MESSAGE] Send one message to the model (stdin if omitted)
+    agent [MESSAGE] Run one bounded agent turn sequence (stdin if omitted)
 ```
 
 Grammar notes: `--flag=value` and `--flag value` both work; only exact
@@ -121,6 +133,9 @@ api_key = "<redacted>"
 timeout_secs = 120
 max_retries = 1
 streaming = true
+
+[agent]
+max_iterations = 5
 ```
 
 ## Errors and exit codes
@@ -128,12 +143,13 @@ streaming = true
 | Situation                                    | Exit | Output |
 | -------------------------------------------- | ---- | ------ |
 | unknown flag/command, bad CLI value, `--version` + command | 2 | stderr usage error + `aurel --help` tip |
-| `chat` with no message and no pipe | 2 | stderr `no message given` |
+| `chat` / `agent` with no message and no pipe | 2 | stderr `no message given` |
 | malformed TOML, unknown key, bad file value (with file path) | 1 | stderr, e.g. `error: invalid TOML in config file '…'` |
 | bad `AUREL_*` value | 1 | stderr names the variable |
 | missing `--config` file                      | 1 | stderr names the path |
 | model/provider failure (unreachable, timeout, auth, malformed…) | 1 | stderr clean provider error, never secrets |
-| `--help` / `--version` / `config show` / `chat` ok | 0 | stdout |
+| `agent` hitting the iteration bound | 1 | partial reply to stdout + `iteration limit reached` warning to stderr |
+| `--help` / `--version` / `config show` / `chat` / `agent` ok | 0 | stdout |
 
 No color output. API keys never appear in logs, diagnostics, errors, or
 `config show` — see `docs/model-providers.md` for the full secret policy.

@@ -40,6 +40,13 @@ impl Message {
             content: content.into(),
         }
     }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Message {
+            role: Role::Assistant,
+            content: content.into(),
+        }
+    }
 }
 
 /// A chat request. Cooperative cancellation is observed between attempts

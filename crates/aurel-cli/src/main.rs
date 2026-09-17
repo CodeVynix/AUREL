@@ -42,7 +42,8 @@ use aurel_config::{
     collect_aurel_env, discover_project_file, global_config_file, load, render_show, LoadRequest,
 };
 use aurel_model::{
-    ChatRequest, ModelProvider, OpenAiCompatible, OpenAiConfig, StreamControl, StreamEvent,
+    Agent, AgentConfig, AgentOutcome, AgentSession, CancelFlag, ChatRequest, ModelProvider,
+    OpenAiCompatible, OpenAiConfig, StreamControl, StreamEvent,
 };
 
 /// Exit code for CLI usage errors (unknown flags, bad commands/values).
@@ -111,9 +112,19 @@ fn print_help(out: &mut dyn Write) -> std::io::Result<()> {
         out,
         "        --log-level <level> error|warn|info|debug|trace"
     )?;
-    writeln!(out, "        --model <name>      Model id for `chat`")?;
-    writeln!(out, "        --base-url <url>    Endpoint root for `chat`")?;
+    writeln!(
+        out,
+        "        --model <name>      Model id for `chat` / `agent`"
+    )?;
+    writeln!(
+        out,
+        "        --base-url <url>    Endpoint root for `chat` / `agent`"
+    )?;
     writeln!(out, "        --streaming <bool>  true|false (default true)")?;
+    writeln!(
+        out,
+        "        --max-iterations <n> 1-100 agent loop bound for `agent`"
+    )?;
     writeln!(out)?;
     writeln!(out, "COMMANDS:")?;
     writeln!(out, "    config show    Print the effective configuration")?;
@@ -124,6 +135,14 @@ fn print_help(out: &mut dyn Write) -> std::io::Result<()> {
     writeln!(
         out,
         "                   the reply (reads piped stdin if omitted)"
+    )?;
+    writeln!(
+        out,
+        "    agent [MESSAGE] Run one bounded agent turn sequence"
+    )?;
+    writeln!(
+        out,
+        "                   and print the reply (stdin if omitted)"
     )?;
     writeln!(out)?;
     writeln!(out, "CONFIG FILES (TOML):")?;
@@ -202,6 +221,45 @@ fn print_chat_help(out: &mut dyn Write) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Render the `agent` command help text to `out`.
+fn print_agent_help(out: &mut dyn Write) -> std::io::Result<()> {
+    writeln!(out, "aurel {}", aurel_core::version())?;
+    writeln!(out)?;
+    writeln!(out, "USAGE:")?;
+    writeln!(out, "    aurel [OPTIONS] agent [MESSAGE]...")?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "Run one bounded agent turn sequence and print the reply."
+    )?;
+    writeln!(
+        out,
+        "With no MESSAGE words, the message is read from piped stdin;"
+    )?;
+    writeln!(out, "a terminal with no message is a usage error.")?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "The loop requests continuations for truncated turns, up to"
+    )?;
+    writeln!(
+        out,
+        "--max-iterations (default 5, hard cap 100). There are no tools"
+    )?;
+    writeln!(out, "yet: the agent cannot inspect, edit, or run anything.")?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "Configure via [model]/[agent] settings, AUREL_* env, or --model /"
+    )?;
+    writeln!(
+        out,
+        "--base-url / --streaming / --max-iterations. There is no --api-key"
+    )?;
+    writeln!(out, "flag: use a config file or AUREL_API_KEY.")?;
+    Ok(())
+}
+
 /// Build the config [`LoadRequest`] for a parsed command line. An explicit
 /// `--config` path replaces global/project discovery (`project_searched` is
 /// then false, rendering "not searched"); otherwise both are discovered
@@ -227,6 +285,7 @@ fn build_request(parsed: &args::Parsed, rt: &Runtime) -> LoadRequest {
         cli_model_name: parsed.model_name.clone(),
         cli_base_url: parsed.base_url.clone(),
         cli_streaming: parsed.streaming,
+        cli_max_iterations: parsed.max_iterations,
     }
 }
 
@@ -283,6 +342,7 @@ fn run_inner(
             HelpTopic::Top => print_help(out),
             HelpTopic::Config => print_config_help(out),
             HelpTopic::Chat => print_chat_help(out),
+            HelpTopic::Agent => print_agent_help(out),
         };
         return if ok.is_ok() { 0 } else { 1 };
     }
@@ -321,6 +381,23 @@ fn run_inner(
                 None => {
                     let live = Runtime::live();
                     execute_chat(&parsed, &text, out, err, &live)
+                }
+            }
+        }
+        Some(Command::Agent { message }) => {
+            let text = match resolve_message(message, stdin, stdin_is_terminal) {
+                Ok(text) => text,
+                Err(e) => {
+                    let _ = writeln!(err, "{e}");
+                    let _ = writeln!(err, "tip: run 'aurel agent --help' for usage.");
+                    return EXIT_USAGE_ERROR;
+                }
+            };
+            match rt {
+                Some(injected) => execute_agent(&parsed, &text, out, err, injected),
+                None => {
+                    let live = Runtime::live();
+                    execute_agent(&parsed, &text, out, err, &live)
                 }
             }
         }
@@ -414,6 +491,31 @@ fn build_provider(
     })
 }
 
+/// Progressive stream sink shared by `chat` and `agent`: prints deltas as
+/// they arrive, and cancels the turn on the first output failure (without a
+/// working sink the rest of the stream is worthless, and continuing would
+/// only waste time and risk duplicate output on any retry).
+struct StreamSink<'a> {
+    out: &'a mut dyn Write,
+    failed: bool,
+}
+
+impl<'a> StreamSink<'a> {
+    fn new(out: &'a mut dyn Write) -> Self {
+        StreamSink { out, failed: false }
+    }
+
+    fn on_event(&mut self, event: StreamEvent) -> StreamControl {
+        if !self.failed
+            && (write!(self.out, "{}", event.delta).is_err() || self.out.flush().is_err())
+        {
+            self.failed = true;
+            return StreamControl::Cancel;
+        }
+        StreamControl::Continue
+    }
+}
+
 /// One request/response exchange against any provider. Streaming deltas
 /// print progressively; the full reply (or the error) determines the exit
 /// code. Provider errors print their own clean messages — never secrets.
@@ -426,21 +528,12 @@ fn chat_with_provider(
 ) -> i32 {
     let request = ChatRequest::one_shot(message, streaming);
     if streaming {
-        let mut write_failed = false;
-        let result = provider.chat_stream(&request, &mut |event: StreamEvent| {
-            if !write_failed && (write!(out, "{}", event.delta).is_err() || out.flush().is_err()) {
-                // Stop consuming: without a working sink the rest of the
-                // stream is worthless, and continuing would only waste time
-                // and risk duplicate output on any retry.
-                write_failed = true;
-                return StreamControl::Cancel;
-            }
-            StreamControl::Continue
-        });
+        let mut sink = StreamSink::new(out);
+        let result = provider.chat_stream(&request, &mut |event| sink.on_event(event));
         match result {
             Ok(_) => {
-                let _ = writeln!(out);
-                if write_failed {
+                let _ = writeln!(sink.out);
+                if sink.failed {
                     1
                 } else {
                     0
@@ -449,7 +542,7 @@ fn chat_with_provider(
             Err(e) => {
                 // A write failure cancels the stream on purpose (see above):
                 // report the real cause, not a misleading cancellation.
-                if write_failed {
+                if sink.failed {
                     let _ = writeln!(err, "error: failed to write model output");
                 } else {
                     let _ = writeln!(err, "{e}");
@@ -470,6 +563,91 @@ fn chat_with_provider(
                 let _ = writeln!(err, "{e}");
                 EXIT_RUNTIME_ERROR
             }
+        }
+    }
+}
+
+/// One bounded agent run: resolve config, build the provider, run the loop
+/// with a fresh in-memory session, and print the outcome.
+///
+/// Exit codes: 0 for a completed run; 1 for iteration-limit, cancellation,
+/// provider/config failures, and output failures. The limit is informative
+/// but nonzero so scripts do not mistake partial output for completion.
+fn execute_agent(
+    parsed: &args::Parsed,
+    message: &str,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    rt: &Runtime,
+) -> i32 {
+    let cfg = match load(&build_request(parsed, rt)) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            let _ = writeln!(err, "{e}");
+            return EXIT_RUNTIME_ERROR;
+        }
+    };
+    let provider = match build_provider(&cfg) {
+        Ok(provider) => provider,
+        Err(e) => {
+            let _ = writeln!(err, "{e}");
+            return EXIT_RUNTIME_ERROR;
+        }
+    };
+    let agent = match Agent::new(
+        provider,
+        AgentConfig {
+            max_iterations: cfg.agent.max_iterations,
+            streaming: cfg.model.streaming,
+        },
+    ) {
+        Ok(agent) => agent,
+        Err(e) => {
+            let _ = writeln!(err, "{e}");
+            return EXIT_RUNTIME_ERROR;
+        }
+    };
+    let cancel = CancelFlag::new();
+    let mut session = AgentSession::new();
+    let mut sink = StreamSink::new(out);
+    let outcome = agent.run(&mut session, message, Some(&cancel), &mut |event| {
+        sink.on_event(event)
+    });
+    let failed = sink.failed;
+    let out = sink.out;
+    match outcome {
+        AgentOutcome::Completed(result) => {
+            if cfg.model.streaming {
+                let _ = writeln!(out);
+            } else if writeln!(out, "{}", result.content).is_err() {
+                return 1;
+            }
+            if failed {
+                1
+            } else {
+                0
+            }
+        }
+        AgentOutcome::IterationLimitReached(result) => {
+            if !cfg.model.streaming {
+                let _ = writeln!(out, "{}", result.content);
+            } else {
+                let _ = writeln!(out);
+            }
+            let _ = writeln!(
+                err,
+                "warning: iteration limit reached ({}) — output may be incomplete",
+                result.iterations
+            );
+            EXIT_RUNTIME_ERROR
+        }
+        AgentOutcome::Cancelled(_) => {
+            let _ = writeln!(err, "error: agent run cancelled");
+            EXIT_RUNTIME_ERROR
+        }
+        AgentOutcome::ProviderError { error, .. } => {
+            let _ = writeln!(err, "{error}");
+            EXIT_RUNTIME_ERROR
         }
     }
 }
@@ -963,6 +1141,67 @@ mod tests {
             run_to_string_with_stdin(&["chat", "hi"], &rt, &mut &b""[..], false);
         assert_eq!(code, EXIT_RUNTIME_ERROR);
         assert!(err.contains("timeout"), "got: {err:?}");
+    }
+
+    #[test]
+    fn agent_help_names_the_loop_bound() {
+        let rt = test_runtime();
+        let (code, out, err) = run_to_string(&["agent", "--help"], &rt);
+        assert_eq!(code, 0);
+        assert!(out.contains("USAGE:"), "got: {out:?}");
+        assert!(out.contains("max-iterations"), "got: {out:?}");
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn agent_without_message_or_pipe_is_exit_2() {
+        let rt = test_runtime();
+        let (code, _out, err) = run_to_string_with_stdin(&["agent"], &rt, &mut &b""[..], false);
+        assert_eq!(code, EXIT_USAGE_ERROR);
+        assert!(err.contains("no message"), "got: {err:?}");
+    }
+
+    #[test]
+    fn agent_invalid_max_iterations_flag_is_exit_2() {
+        let rt = test_runtime();
+        let (code, _out, err) = run_to_string(&["--max-iterations", "0", "agent", "hi"], &rt);
+        assert_eq!(code, EXIT_USAGE_ERROR);
+        assert!(err.contains("--max-iterations"), "got: {err:?}");
+    }
+
+    #[test]
+    fn agent_build_failure_is_exit_1_without_network() {
+        // timeout_secs 0 fails provider construction before any I/O, even on
+        // the agent path.
+        let rt = Runtime {
+            cwd: test_runtime().cwd,
+            appdata: None,
+            home: None,
+            env: [("AUREL_TIMEOUT_SECS".to_string(), "0".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let (code, _out, err) =
+            run_to_string_with_stdin(&["agent", "hi"], &rt, &mut &b""[..], false);
+        assert_eq!(code, EXIT_RUNTIME_ERROR);
+        assert!(err.contains("timeout"), "got: {err:?}");
+    }
+
+    #[test]
+    fn agent_rejects_over_cap_iterations_without_network() {
+        // max_iterations above the hard cap fails agent construction: no I/O.
+        let rt = Runtime {
+            cwd: test_runtime().cwd,
+            appdata: None,
+            home: None,
+            env: [("AUREL_MAX_ITERATIONS".to_string(), "101".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let (code, _out, err) =
+            run_to_string_with_stdin(&["agent", "hi"], &rt, &mut &b""[..], false);
+        assert_eq!(code, EXIT_RUNTIME_ERROR);
+        assert!(err.contains("max_iterations"), "got: {err:?}");
     }
 
     /// Non-Unicode OS input for the current platform (bytes that are invalid

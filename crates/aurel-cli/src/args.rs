@@ -11,9 +11,10 @@
 //!   files. Combining it with a command is a usage error.
 //! - `--config <path>` — replace file discovery with exactly this file.
 //! - `--log-level <level>` — `error|warn|info|debug|trace` (case-insensitive).
-//! - `--model <name>` — model id for `chat`.
-//! - `--base-url <url>` — endpoint root for `chat`.
+//! - `--model <name>` — model id for `chat` / `agent`.
+//! - `--base-url <url>` — endpoint root for `chat` / `agent`.
 //! - `--streaming <bool>` — `true`/`false` (case-insensitive).
+//! - `--max-iterations <n>` — 1–100 agent loop bound for `agent`.
 //!
 //! There is deliberately no `--api-key` flag: keys in argv leak into shell
 //! history and process listings. Use a config file or `AUREL_API_KEY`.
@@ -27,6 +28,9 @@
 //!   terminal with no message is a usage error). `chat --help` prints
 //!   command help. A `--` token inside the chat zone forces the rest to be
 //!   message words.
+//! - `agent [MESSAGE]...` — run one bounded agent turn sequence and exit 0.
+//!   Message acquisition works exactly like `chat`. `agent --help` prints
+//!   command help.
 //!
 //! Rules:
 //!
@@ -50,6 +54,7 @@ pub enum HelpTopic {
     Top,
     Config,
     Chat,
+    Agent,
 }
 
 /// Parsed subcommand.
@@ -57,6 +62,7 @@ pub enum HelpTopic {
 pub enum Command {
     ConfigShow,
     Chat { message: Vec<String> },
+    Agent { message: Vec<String> },
 }
 
 /// Successfully parsed command line.
@@ -69,6 +75,7 @@ pub struct Parsed {
     pub model_name: Option<String>,
     pub base_url: Option<String>,
     pub streaming: Option<bool>,
+    pub max_iterations: Option<u32>,
     pub command: Option<Command>,
 }
 
@@ -109,7 +116,7 @@ impl fmt::Display for ParseError {
             ParseError::UnknownCommand(cmd) => {
                 write!(
                     f,
-                    "error: unknown command '{cmd}' (expected one of: config, chat)"
+                    "error: unknown command '{cmd}' (expected one of: config, chat, agent)"
                 )
             }
             ParseError::UnexpectedCommandArgument { arg } => write!(
@@ -138,6 +145,18 @@ fn split_long(token: &str) -> (&str, Option<&str>) {
 enum CommandWord {
     Config,
     Chat,
+    Agent,
+}
+
+impl CommandWord {
+    /// Help topic for `word --help` (and bare `config`).
+    fn help_topic(self) -> HelpTopic {
+        match self {
+            CommandWord::Config => HelpTopic::Config,
+            CommandWord::Chat => HelpTopic::Chat,
+            CommandWord::Agent => HelpTopic::Agent,
+        }
+    }
 }
 
 /// Parse already-normalized (lossy `OsString`) arguments, excluding argv[0].
@@ -229,6 +248,25 @@ pub fn parse(args: &[String]) -> Result<Parsed, ParseError> {
                             })?);
                         continue;
                     }
+                    "--max-iterations" => {
+                        let value = match inline {
+                            Some(v) => v.to_string(),
+                            None => iter.next().cloned().ok_or(ParseError::MissingValue {
+                                flag: "--max-iterations",
+                            })?,
+                        };
+                        // At least 1 here; the upper cap lives with the loop
+                        // (Agent::new), which reports it with run context.
+                        out.max_iterations =
+                            Some(value.parse::<u32>().ok().filter(|&n| n >= 1).ok_or(
+                                ParseError::InvalidValue {
+                                    flag: "--max-iterations",
+                                    value,
+                                    expected: "an integer of at least 1",
+                                },
+                            )?);
+                        continue;
+                    }
                     _ => return Err(ParseError::UnknownFlag(token.clone())),
                 }
             }
@@ -236,8 +274,8 @@ pub fn parse(args: &[String]) -> Result<Parsed, ParseError> {
             in_command = true;
         }
 
-        // Command zone: `config` takes a fixed subcommand, `chat` takes
-        // free-form message words.
+        // Command zone: `config` takes a fixed subcommand; `chat` and
+        // `agent` take free-form message words.
         match command_word {
             None => {
                 command_word = Some(match token.as_str() {
@@ -247,6 +285,12 @@ pub fn parse(args: &[String]) -> Result<Parsed, ParseError> {
                             message: Vec::new(),
                         });
                         CommandWord::Chat
+                    }
+                    "agent" => {
+                        out.command = Some(Command::Agent {
+                            message: Vec::new(),
+                        });
+                        CommandWord::Agent
                     }
                     other => return Err(ParseError::UnknownCommand(other.to_string())),
                 });
@@ -265,21 +309,23 @@ pub fn parse(args: &[String]) -> Result<Parsed, ParseError> {
                     return Err(ParseError::UnexpectedCommandArgument { arg: token.clone() });
                 }
             },
-            Some(CommandWord::Chat) => match &mut out.command {
-                Some(Command::Chat { message }) => match token.as_str() {
-                    "-h" | "--help" => {
-                        out.command = None;
-                        out.help = Some(HelpTopic::Chat);
+            Some(word) => match &mut out.command {
+                Some(Command::Chat { message }) | Some(Command::Agent { message }) => {
+                    match token.as_str() {
+                        "-h" | "--help" => {
+                            out.command = None;
+                            out.help = Some(word.help_topic());
+                        }
+                        "--" => {
+                            // Everything after is message, even flag-shaped words.
+                            message.extend(iter.map(Clone::clone));
+                            break;
+                        }
+                        _ => message.push(token.clone()),
                     }
-                    "--" => {
-                        // Everything after is message, even flag-shaped words.
-                        message.extend(iter.map(Clone::clone));
-                        break;
-                    }
-                    _ => message.push(token.clone()),
-                },
-                // Help was selected mid-command (`chat --help`): anything
-                // further is a usage error.
+                }
+                // Help was selected mid-command: anything further is a usage
+                // error.
                 _ => {
                     return Err(ParseError::UnexpectedCommandArgument { arg: token.clone() });
                 }
@@ -469,6 +515,45 @@ mod tests {
         ));
         assert!(matches!(
             parse(&args(&["--version", "chat", "hi"])),
+            Err(ParseError::VersionWithCommand)
+        ));
+    }
+
+    #[test]
+    fn agent_collects_message_like_chat() {
+        let parsed = parse(&args(&["agent", "hello", "world"])).expect("agent");
+        assert_eq!(
+            parsed.command,
+            Some(Command::Agent {
+                message: vec!["hello".to_string(), "world".to_string()]
+            })
+        );
+        let parsed = parse(&args(&["agent"])).expect("bare agent");
+        assert_eq!(parsed.command, Some(Command::Agent { message: vec![] }));
+        assert_eq!(parsed.help, None);
+        let parsed = parse(&args(&["agent", "--help"])).expect("agent help");
+        assert_eq!(parsed.help, Some(HelpTopic::Agent));
+        assert_eq!(parsed.command, None);
+        let parsed = parse(&args(&["--max-iterations=3", "agent", "hi"])).expect("flag");
+        assert_eq!(parsed.max_iterations, Some(3));
+    }
+
+    #[test]
+    fn invalid_max_iterations_is_usage_error() {
+        assert!(matches!(
+            parse(&args(&["--max-iterations"])),
+            Err(ParseError::MissingValue { .. })
+        ));
+        assert!(matches!(
+            parse(&args(&["--max-iterations", "0"])),
+            Err(ParseError::InvalidValue { .. })
+        ));
+        assert!(matches!(
+            parse(&args(&["--max-iterations", "many"])),
+            Err(ParseError::InvalidValue { .. })
+        ));
+        assert!(matches!(
+            parse(&args(&["--version", "agent", "hi"])),
             Err(ParseError::VersionWithCommand)
         ));
     }

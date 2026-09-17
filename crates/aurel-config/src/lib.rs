@@ -47,6 +47,8 @@ pub const ENV_TIMEOUT_SECS: &str = "AUREL_TIMEOUT_SECS";
 pub const ENV_MAX_RETRIES: &str = "AUREL_MAX_RETRIES";
 /// Environment variable overriding `[model] streaming` (`true`/`false`).
 pub const ENV_STREAMING: &str = "AUREL_STREAMING";
+/// Environment variable overriding `[agent] max_iterations`.
+pub const ENV_MAX_ITERATIONS: &str = "AUREL_MAX_ITERATIONS";
 
 /// Log verbosity. Spelled lowercase in every source; parsing is
 /// case-insensitive.
@@ -187,6 +189,7 @@ impl fmt::Debug for ModelSettings {
 
 /// Partial `[model]` table as read from a single TOML file. Every field is
 /// optional; unknown fields are rejected.
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ModelFileConfig {
@@ -204,6 +207,28 @@ struct ModelFileConfig {
     streaming: Option<bool>,
 }
 
+/// Agent run settings (`[agent]`). Only the iteration bound exists at this
+/// stage; tool permissions arrive with tools (Phase 4+).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentSettings {
+    pub max_iterations: u32,
+}
+
+impl Default for AgentSettings {
+    fn default() -> Self {
+        AgentSettings { max_iterations: 5 }
+    }
+}
+
+/// Partial `[agent]` table as read from a single TOML file. Every field is
+/// optional; unknown fields are rejected.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentFileConfig {
+    #[serde(default)]
+    max_iterations: Option<u32>,
+}
+
 /// Partial configuration as read from a single TOML file.
 ///
 /// Every field is optional; a file may set any subset. Unknown fields are
@@ -214,6 +239,8 @@ struct FileConfig {
     log_level: Option<LogLevel>,
     #[serde(default)]
     model: Option<ModelFileConfig>,
+    #[serde(default)]
+    agent: Option<AgentFileConfig>,
 }
 
 /// Fully resolved configuration plus where each file layer came from.
@@ -222,6 +249,7 @@ struct FileConfig {
 pub struct EffectiveConfig {
     pub log_level: LogLevel,
     pub model: ModelSettings,
+    pub agent: AgentSettings,
     /// Discovered global file path, if the home location was resolvable.
     pub global_file: Option<PathBuf>,
     /// Whether the global file existed and was applied.
@@ -268,6 +296,8 @@ pub struct LoadRequest {
     pub cli_base_url: Option<String>,
     /// `--streaming` override. `None` means not given.
     pub cli_streaming: Option<bool>,
+    /// `--max-iterations` override. `None` means not given.
+    pub cli_max_iterations: Option<u32>,
 }
 
 impl fmt::Debug for LoadRequest {
@@ -290,6 +320,7 @@ impl fmt::Debug for LoadRequest {
             .field("cli_model_name", &self.cli_model_name)
             .field("cli_base_url", &self.cli_base_url)
             .field("cli_streaming", &self.cli_streaming)
+            .field("cli_max_iterations", &self.cli_max_iterations)
             .finish()
     }
 }
@@ -382,26 +413,27 @@ fn parse_file(path: &Path, text: &str) -> Result<FileConfig, ConfigError> {
 pub fn load(req: &LoadRequest) -> Result<EffectiveConfig, ConfigError> {
     let mut log_level = LogLevel::default();
     let mut model = ModelSettings::default();
+    let mut agent = AgentSettings::default();
     let mut global_found = false;
     let mut project_found = false;
 
     if let Some(path) = &req.global_file {
         if let Some(file) = read_optional_file(path)? {
-            apply_file(&file, &mut log_level, &mut model);
+            apply_file(&file, &mut log_level, &mut model, &mut agent);
             global_found = true;
         }
     }
 
     if let Some(path) = &req.project_file {
         if let Some(file) = read_optional_file(path)? {
-            apply_file(&file, &mut log_level, &mut model);
+            apply_file(&file, &mut log_level, &mut model, &mut agent);
             project_found = true;
         }
     }
 
     if let Some(path) = &req.explicit_file {
         let file = read_required_file(path)?;
-        apply_file(&file, &mut log_level, &mut model);
+        apply_file(&file, &mut log_level, &mut model, &mut agent);
     }
 
     if let Some(value) = req.env.get(ENV_LOG_LEVEL) {
@@ -414,6 +446,7 @@ pub fn load(req: &LoadRequest) -> Result<EffectiveConfig, ConfigError> {
             })?;
     }
     apply_model_env(&req.env, &mut model)?;
+    apply_agent_env(&req.env, &mut agent)?;
 
     if let Some(level) = req.cli_log_level {
         log_level = level;
@@ -427,10 +460,14 @@ pub fn load(req: &LoadRequest) -> Result<EffectiveConfig, ConfigError> {
     if let Some(streaming) = req.cli_streaming {
         model.streaming = streaming;
     }
+    if let Some(max) = req.cli_max_iterations {
+        agent.max_iterations = max;
+    }
 
     Ok(EffectiveConfig {
         log_level,
         model,
+        agent,
         global_file: req.global_file.clone(),
         global_found,
         project_file: req.project_file.clone(),
@@ -441,7 +478,12 @@ pub fn load(req: &LoadRequest) -> Result<EffectiveConfig, ConfigError> {
 }
 
 /// Overlay one file's values onto the running resolution.
-fn apply_file(file: &FileConfig, log_level: &mut LogLevel, model: &mut ModelSettings) {
+fn apply_file(
+    file: &FileConfig,
+    log_level: &mut LogLevel,
+    model: &mut ModelSettings,
+    agent: &mut AgentSettings,
+) {
     if let Some(level) = file.log_level {
         *log_level = level;
     }
@@ -463,6 +505,11 @@ fn apply_file(file: &FileConfig, log_level: &mut LogLevel, model: &mut ModelSett
         }
         if let Some(streaming) = table.streaming {
             model.streaming = streaming;
+        }
+    }
+    if let Some(table) = &file.agent {
+        if let Some(max) = table.max_iterations {
+            agent.max_iterations = max;
         }
     }
 }
@@ -501,6 +548,22 @@ fn apply_model_env(
             var: ENV_STREAMING.to_string(),
             value: value.clone(),
             message: e.to_string(),
+        })?;
+    }
+    Ok(())
+}
+
+/// Overlay the `AUREL_MAX_ITERATIONS` variable. Range checks belong to the
+/// agent loop, which reports them with run context; loading stays total.
+fn apply_agent_env(
+    env: &HashMap<String, String>,
+    agent: &mut AgentSettings,
+) -> Result<(), ConfigError> {
+    if let Some(value) = env.get(ENV_MAX_ITERATIONS) {
+        agent.max_iterations = value.parse().map_err(|_| ConfigError::InvalidEnv {
+            var: ENV_MAX_ITERATIONS.to_string(),
+            value: value.clone(),
+            message: "expected an iteration count as an unsigned integer".to_string(),
         })?;
     }
     Ok(())
@@ -609,6 +672,8 @@ pub fn render_show(cfg: &EffectiveConfig) -> String {
     out.push_str(&format!("timeout_secs = {}\n", cfg.model.timeout_secs));
     out.push_str(&format!("max_retries = {}\n", cfg.model.max_retries));
     out.push_str(&format!("streaming = {}\n", cfg.model.streaming));
+    out.push_str("\n[agent]\n");
+    out.push_str(&format!("max_iterations = {}\n", cfg.agent.max_iterations));
     out
 }
 
@@ -834,6 +899,7 @@ mod tests {
         let cfg = EffectiveConfig {
             log_level: LogLevel::Debug,
             model: ModelSettings::default(),
+            agent: AgentSettings::default(),
             global_file: Some(PathBuf::from("/g/config.toml")),
             global_found: false,
             project_file: Some(PathBuf::from("/p/.aurel/config.toml")),
@@ -853,6 +919,7 @@ mod tests {
         let searched_empty = EffectiveConfig {
             log_level: LogLevel::Info,
             model: ModelSettings::default(),
+            agent: AgentSettings::default(),
             global_file: Some(PathBuf::from("/g/config.toml")),
             global_found: false,
             project_file: None,
@@ -946,6 +1013,54 @@ mod tests {
         assert_eq!(cfg.model.timeout_secs, 60);
         assert_eq!(cfg.model.max_retries, 1);
         assert!(cfg.model.streaming);
+        assert_eq!(cfg.agent.max_iterations, 5);
+    }
+
+    #[test]
+    fn agent_precedence_is_file_env_cli() {
+        let dir = test_dir("agent-precedence");
+        let project = dir.join("project.toml");
+        write(&project, "[agent]\nmax_iterations = 2\n");
+        let mut req = request();
+        req.project_file = Some(project);
+        req.project_searched = true;
+
+        assert_eq!(load(&req).expect("file").agent.max_iterations, 2);
+
+        req.env.insert(ENV_MAX_ITERATIONS.into(), "7".into());
+        assert_eq!(load(&req).expect("env").agent.max_iterations, 7);
+
+        req.cli_max_iterations = Some(3);
+        assert_eq!(load(&req).expect("cli").agent.max_iterations, 3);
+    }
+
+    #[test]
+    fn invalid_max_iterations_env_names_its_variable() {
+        let mut req = request();
+        req.env.insert(ENV_MAX_ITERATIONS.into(), "many".into());
+        let err = load(&req).expect_err("must fail");
+        assert!(matches!(err, ConfigError::InvalidEnv { .. }), "{err:?}");
+        assert!(err.to_string().contains(ENV_MAX_ITERATIONS), "{err:?}");
+    }
+
+    #[test]
+    fn unknown_agent_field_is_rejected() {
+        let dir = test_dir("agent-unknown-field");
+        let path = dir.join("typo.toml");
+        write(&path, "[agent]\nmax_iters = 2\n");
+        let mut req = request();
+        req.project_file = Some(path);
+        assert!(
+            matches!(load(&req), Err(ConfigError::MalformedFile { .. })),
+            "typo'd agent keys must not be silently ignored"
+        );
+    }
+
+    #[test]
+    fn show_reports_agent_settings() {
+        let text = render_show(&load(&request()).expect("defaults"));
+        assert!(text.contains("[agent]"), "got: {text:?}");
+        assert!(text.contains("max_iterations = 5"), "got: {text:?}");
     }
 
     #[test]
