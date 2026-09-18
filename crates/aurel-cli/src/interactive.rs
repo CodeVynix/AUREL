@@ -8,13 +8,20 @@
 //! path is unit-testable.
 
 use std::io::{BufRead, Write};
+use std::path::PathBuf;
 
 use aurel_config::EffectiveConfig;
 use aurel_model::{Agent, AgentConfig, AgentSession, CancelFlag, Mode, ModelProvider};
+use aurel_tools::{InitOutcome, AGENTS_MD};
 
 use super::{
     build_provider, build_request, print_agent_outcome, Runtime, StreamSink, EXIT_RUNTIME_ERROR,
 };
+
+/// Shared empty-input hint, printed when the user submits a blank line.
+/// Kept as one constant so the CLI and any future frontends (Desktop)
+/// phrase empty input identically.
+pub const EMPTY_INPUT_HINT: &str = "Ask anything, / for commands, @ for context, ! for shell...";
 
 /// Context scope for one prompt (leading `@general` / `@explore` token).
 /// A placeholder for future retrieval: today both scopes run against the
@@ -65,6 +72,10 @@ pub enum SlashCommand {
     Model,
     Config,
     Tools,
+    Init {
+        /// Explicit replacement of an existing `AGENTS.md`.
+        force: bool,
+    },
     Exit,
     Unknown(String),
 }
@@ -151,6 +162,11 @@ fn parse_slash(rest: &str) -> SlashCommand {
         "model" => SlashCommand::Model,
         "config" => SlashCommand::Config,
         "tools" => SlashCommand::Tools,
+        "init" => match args {
+            "" => SlashCommand::Init { force: false },
+            "--force" => SlashCommand::Init { force: true },
+            _ => SlashCommand::Unknown(format!("init {args}")),
+        },
         "exit" | "quit" => SlashCommand::Exit,
         _ => SlashCommand::Unknown(name.to_string()),
     }
@@ -180,12 +196,19 @@ pub struct Repl<P> {
     agent: Agent<P>,
     session: AgentSession,
     config: EffectiveConfig,
+    /// Project root for `AGENTS.md` creation and instructions discovery
+    /// (the working directory the loop started in).
+    workdir: PathBuf,
     iterations_used: u32,
     compactions: u32,
 }
 
 impl<P: ModelProvider> Repl<P> {
-    pub fn new(provider: P, config: EffectiveConfig) -> Result<Self, aurel_model::ProviderError> {
+    pub fn new(
+        provider: P,
+        config: EffectiveConfig,
+        workdir: PathBuf,
+    ) -> Result<Self, aurel_model::ProviderError> {
         let agent = Agent::new(
             provider,
             AgentConfig {
@@ -197,6 +220,7 @@ impl<P: ModelProvider> Repl<P> {
             agent,
             session: AgentSession::new(),
             config,
+            workdir,
             iterations_used: 0,
             compactions: 0,
         })
@@ -215,7 +239,10 @@ impl<P: ModelProvider> Repl<P> {
         err: &mut dyn Write,
     ) -> bool {
         match input {
-            InputKind::Empty => true,
+            InputKind::Empty => {
+                let _ = writeln!(out, "{EMPTY_INPUT_HINT}");
+                true
+            }
             InputKind::TabToggle => {
                 let mode = self.mode().toggle();
                 self.session.set_mode(mode);
@@ -322,10 +349,11 @@ impl<P: ModelProvider> Repl<P> {
                 true
             }
             SlashCommand::Tools => {
-                let _ = writeln!(
-                    out,
-                    "No tools registered yet — the tool system arrives in a later phase. (No action was taken.)"
-                );
+                self.print_tools(out);
+                true
+            }
+            SlashCommand::Init { force } => {
+                self.run_init(*force, out, err);
                 true
             }
             SlashCommand::Exit => false,
@@ -356,6 +384,7 @@ impl<P: ModelProvider> Repl<P> {
                 "note: cross-session retrieval is not implemented yet; answering from the current session only."
             );
         }
+        self.refresh_instructions(err);
         match self.agent.maybe_auto_compact(
             &mut self.session,
             self.config.agent.auto_compaction,
@@ -396,6 +425,7 @@ impl<P: ModelProvider> Repl<P> {
             return;
         }
         let _ = writeln!(out, "[btw] {question}");
+        self.refresh_instructions(err);
         let cancel = CancelFlag::new();
         let mut sink = StreamSink::new(out);
         let outcome = self
@@ -427,6 +457,64 @@ impl<P: ModelProvider> Repl<P> {
             }
             Err(error) => {
                 let _ = writeln!(err, "{error}");
+            }
+        }
+    }
+
+    fn print_tools(&self, out: &mut dyn Write) {
+        let _ = writeln!(out, "Tools (all read-only in this phase):");
+        for tool in aurel_tools::tool_catalog() {
+            let _ = writeln!(
+                out,
+                "  {} — {} [{}]",
+                tool.name,
+                tool.description,
+                tool.permission.as_str()
+            );
+        }
+    }
+
+    /// Create `AGENTS.md` in the loop's working directory. Refuses to
+    /// overwrite without explicit `--force`; prints paths in every case.
+    fn run_init(&self, force: bool, out: &mut dyn Write, err: &mut dyn Write) {
+        match aurel_tools::init_agents_md(&self.workdir, force) {
+            Ok(InitOutcome::Created(path)) => {
+                let _ = writeln!(
+                    out,
+                    "Created {} (starter template — edit it for your project).",
+                    path.display()
+                );
+            }
+            Ok(InitOutcome::Overwritten(path)) => {
+                let _ = writeln!(out, "Overwrote {} (--force).", path.display());
+            }
+            Ok(InitOutcome::AlreadyExists(path)) => {
+                let _ = writeln!(
+                    err,
+                    "error: {} already exists (not overwriting; use /init --force to replace it)",
+                    path.display()
+                );
+            }
+            Err(error) => {
+                let _ = writeln!(err, "{error}");
+            }
+        }
+    }
+
+    /// Refresh project instructions from the nearest `AGENTS.md` above the
+    /// working directory. Absent files clear the session value so a deleted
+    /// file stops applying; load failures warn and continue bare.
+    fn refresh_instructions(&mut self, err: &mut dyn Write) {
+        match aurel_tools::load_instructions_for_dir(&self.workdir) {
+            Ok(found) => self
+                .session
+                .set_instructions(found.map(|loaded| loaded.content)),
+            Err(error) => {
+                self.session.set_instructions(None);
+                let _ = writeln!(
+                    err,
+                    "warning: could not load {AGENTS_MD}: {error} (continuing)"
+                );
             }
         }
     }
@@ -588,7 +676,8 @@ Commands (local — never sent to the model):
   /settings [show|set]  View or change session settings
   /model                Not implemented yet
   /config               Show effective configuration (key redacted)
-  /tools                No tools registered yet
+  /tools                List registered tools (all read-only in this phase)
+  /init [--force]       Create AGENTS.md starter (never overwrites silently)
   /exit | /quit         Leave the loop
 @general / @explore prefix one prompt with a context scope.
 !command names an explicit shell request (not run yet).
@@ -618,7 +707,7 @@ pub fn start_interactive(
             return EXIT_RUNTIME_ERROR;
         }
     };
-    let mut repl = match Repl::new(provider, cfg) {
+    let mut repl = match Repl::new(provider, cfg, rt.cwd.clone()) {
         Ok(repl) => repl,
         Err(error) => {
             let _ = writeln!(err, "{error}");
@@ -636,12 +725,14 @@ mod tests {
     use std::cell::Cell;
     use std::collections::VecDeque;
 
-    /// Scripted provider double with canned chat outcomes.
+    /// Scripted provider double with canned chat outcomes. Records every
+    /// received message list so tests can assert on request context.
     struct ScriptedProvider {
         script: std::cell::RefCell<
             VecDeque<Result<aurel_model::ChatResponse, aurel_model::ProviderError>>,
         >,
         calls: Cell<usize>,
+        seen: std::cell::RefCell<Vec<Vec<aurel_model::Message>>>,
     }
 
     impl ScriptedProvider {
@@ -672,9 +763,10 @@ mod tests {
 
         fn chat(
             &self,
-            _request: &aurel_model::ChatRequest,
+            request: &aurel_model::ChatRequest,
         ) -> Result<aurel_model::ChatResponse, aurel_model::ProviderError> {
             self.calls.set(self.calls.get() + 1);
+            self.seen.borrow_mut().push(request.messages.clone());
             self.script
                 .borrow_mut()
                 .pop_front()
@@ -706,13 +798,26 @@ mod tests {
     fn test_repl(
         script: Vec<Result<aurel_model::ChatResponse, aurel_model::ProviderError>>,
     ) -> Repl<ScriptedProvider> {
+        test_repl_in(
+            script,
+            std::env::temp_dir().join(format!("aurel-repl-test-{}", std::process::id())),
+        )
+    }
+
+    fn test_repl_in(
+        script: Vec<Result<aurel_model::ChatResponse, aurel_model::ProviderError>>,
+        workdir: std::path::PathBuf,
+    ) -> Repl<ScriptedProvider> {
+        std::fs::create_dir_all(&workdir).expect("test workdir");
         let cfg = aurel_config::load(&LoadRequest::default()).expect("defaults load");
         Repl::new(
             ScriptedProvider {
                 script: std::cell::RefCell::new(script.into()),
                 calls: Cell::new(0),
+                seen: std::cell::RefCell::new(Vec::new()),
             },
             cfg,
+            workdir,
         )
         .expect("repl builds")
     }
@@ -815,7 +920,10 @@ mod tests {
         assert!(out.contains("not implemented yet"));
         let (cont, out, _) = dispatch_to_string(&mut repl, &InputKind::Slash(SlashCommand::Tools));
         assert!(cont);
-        assert!(out.contains("No tools registered yet"));
+        for name in ["read_file", "list_dir", "stat", "search"] {
+            assert!(out.contains(name), "catalog must list {name}: {out:?}");
+        }
+        assert!(out.contains("read-only"), "got: {out:?}");
         let (cont, out, _) =
             dispatch_to_string(&mut repl, &InputKind::ShellRequest("rm -rf /".into()));
         assert!(cont);
@@ -980,5 +1088,110 @@ mod tests {
         let (_, out, _) = dispatch_to_string(&mut repl, &InputKind::Slash(SlashCommand::Config));
         assert!(out.contains("api_key = \"<redacted>\""), "got: {out:?}");
         assert!(!out.contains("sk-test-00"), "leak: {out:?}");
+    }
+
+    #[test]
+    fn parses_init_forms() {
+        assert_eq!(
+            parse_input_line("/init"),
+            InputKind::Slash(SlashCommand::Init { force: false })
+        );
+        assert_eq!(
+            parse_input_line("/init --force"),
+            InputKind::Slash(SlashCommand::Init { force: true })
+        );
+        assert!(matches!(
+            parse_input_line("/init --bogus"),
+            InputKind::Slash(SlashCommand::Unknown(_))
+        ));
+        let (_, out, _) = dispatch_to_string(
+            &mut test_repl(vec![]),
+            &InputKind::Slash(SlashCommand::Help),
+        );
+        assert!(
+            out.contains("/init [--force]"),
+            "help must document /init: {out:?}"
+        );
+    }
+
+    #[test]
+    fn init_creates_refuses_and_forces() {
+        let workdir = std::env::temp_dir().join(format!("aurel-init-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&workdir);
+        let mut repl = test_repl_in(vec![], workdir.clone());
+
+        // Creates with the starter template.
+        let (cont, out, _) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Init { force: false }),
+        );
+        assert!(cont);
+        assert!(out.contains("Created"), "got: {out:?}");
+        assert!(out.contains("AGENTS.md"), "got: {out:?}");
+        let text = std::fs::read_to_string(workdir.join("AGENTS.md")).expect("file created");
+        assert!(text.contains("# AGENTS.md"), "got: {text:?}");
+
+        // Refuses without force, naming the file and the flag.
+        let (cont, _, err) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Init { force: false }),
+        );
+        assert!(cont);
+        assert!(err.contains("already exists"), "got: {err:?}");
+        assert!(err.contains("--force"), "got: {err:?}");
+
+        // Explicit force replaces.
+        std::fs::write(workdir.join("AGENTS.md"), "custom").expect("customize");
+        let (cont, out, _) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Init { force: true }),
+        );
+        assert!(cont);
+        assert!(out.contains("Overwrote"), "got: {out:?}");
+        let text = std::fs::read_to_string(workdir.join("AGENTS.md")).expect("read back");
+        assert!(!text.contains("custom"), "force must replace: {text:?}");
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn empty_input_prints_the_shared_hint() {
+        let mut repl = test_repl(vec![]);
+        let (cont, out, err) = dispatch_to_string(&mut repl, &InputKind::Empty);
+        assert!(cont);
+        assert_eq!(out, format!("{EMPTY_INPUT_HINT}\n"));
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn run_prompt_loads_instructions_into_requests_not_history() {
+        let workdir = std::env::temp_dir().join(format!("aurel-instr-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&workdir);
+        std::fs::create_dir_all(&workdir).expect("mkdir");
+        std::fs::write(workdir.join("AGENTS.md"), "Prefer tabs.\n").expect("instructions");
+        let mut repl = test_repl_in(vec![ScriptedProvider::reply("ok")], workdir.clone());
+
+        let (cont, out, _) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Prompt {
+                scope: ContextScope::General,
+                text: "do it".into(),
+            },
+        );
+        assert!(cont);
+        assert!(out.contains("ok"), "got: {out:?}");
+        // The provider saw instructions first, then the user message.
+        let seen = repl.agent.provider().seen.borrow();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].len(), 2);
+        assert_eq!(seen[0][0].content, "Prefer tabs.\n");
+        assert_eq!(seen[0][1].content, "do it");
+        // History holds only the exchange itself.
+        assert_eq!(repl.session.history().len(), 2);
+        assert!(repl
+            .session
+            .history()
+            .iter()
+            .all(|message| message.content != "Prefer tabs.\n"));
+        let _ = std::fs::remove_dir_all(&workdir);
     }
 }

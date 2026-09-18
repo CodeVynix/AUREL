@@ -1,10 +1,10 @@
-# AUREL Architecture — Phase 4
+# AUREL Architecture — Phase 5
 
-This document describes what Phase 3 actually contains. Nothing more.
+This document describes what Phase 5 actually contains. Nothing more.
 
 ## Workspace
 
-Single Cargo workspace (`Cargo.toml`, `resolver = "2"`) with four members.
+Single Cargo workspace (`Cargo.toml`, `resolver = "2"`) with five members.
 Shared package metadata (`version`, `edition`, `rust-version`, `license`)
 is defined once in `[workspace.package]` and inherited by all crates, so
 there is one version definition feeding package metadata, the runtime
@@ -24,8 +24,11 @@ display (`aurel_core::version()`), and the test expectations:
   `AgentSession`, `AgentOutcome`). Owns the HTTP/TLS/JSON dependencies (see
   ADR-0006); nothing else in the workspace touches the network.
 - `crates/aurel-cli` — binary crate producing the `aurel` binary
-  (`[[bin]] name = "aurel"`). Depends on all three libraries via local path
+  (`[[bin]] name = "aurel"`). Depends on all four libraries via local path
   dependencies. Argument parsing itself is still dependency-free.
+- `crates/aurel-tools` — library crate (`aurel_tools`). Read-only
+  inspection tools plus `AGENTS.md` project instructions. Zero third-party
+  dependencies by design.
 
 The root manifest is workspace-only (no root package). `Cargo.lock` is
 committed because the workspace produces a binary.
@@ -87,8 +90,34 @@ turns — append a `system` "Continue." cue and request again, up to
 `Completed`, `IterationLimitReached` (partial work kept, exit 1 with a
 warning), `Cancelled`, and `ProviderError` — each carrying accumulated
 content, call count, and summed usage. Cancellation reuses the Phase 2
-`CancelFlag`. There are no tools: the loop cannot inspect, edit, or run
-anything (that is Phase 5+).
+`CancelFlag`. Project instructions ride along as a leading `system`
+message per request without entering history.
+
+## Read-only tools
+
+`crates/aurel-tools` (`ToolContext`, zero dependencies) implements the
+four inspection tools — `read_file`, `list_dir`, `stat`, `search` — behind
+one workspace sandbox: every path is joined to the bound root,
+canonicalized (resolving symlinks to their real targets), and rejected
+with `OutsideWorkspace` unless it stays inside. `..` traversal, absolute
+escapes, and symlink breakouts all fail closed; failures are typed
+(`ToolError`), never panics. Every tool is bounded (`Limits`: byte caps,
+entry/match caps, depth cap, per-line caps) and `search` additionally
+skips `.git`/`target`/binaries/oversized files, never follows symlinks,
+and honors cooperative cancellation. All four carry
+`Permission::ReadOnly`, valid in both Plan and Build modes — Plan forbids
+*mutation*, and nothing here mutates. Listed at runtime via `/tools`.
+
+## Project instructions (`AGENTS.md`)
+
+`/init` writes a starter `AGENTS.md` into the working directory — only
+when absent, or with explicit `/init --force`; existing files are
+reported, never silently replaced. Every agent run (one-shot or
+interactive) discovers the nearest `AGENTS.md` above the working
+directory and sends it as the leading `system` message described above;
+absent files run bare, unreadable ones warn and continue. Oversized files
+truncate at 64 KiB with a marker. The file itself stays user-owned:
+AUREL never edits it.
 
 ## Interaction layer
 
@@ -158,8 +187,8 @@ requirement plus an ADR.
 
 - Third-party dependencies: `serde` + parse-only `toml` (config), plus the
   HTTP/TLS/JSON stack (`ureq`, `rustls` + crypto, `serde_json`) confined to
-  `aurel-model` (`cargo tree` shows `aurel-core` still dependency-free; the
-  parser in `aurel-cli` is dependency-free).
+  `aurel-model` (`cargo tree` shows `aurel-core` and `aurel-tools` still
+  dependency-free; the parser in `aurel-cli` is dependency-free).
 - No background threads/workers (test stub servers excepted), no config
   file I/O except the files being loaded, no model-server code inside
   AUREL (server memory is the server's, never attributed here).
@@ -234,3 +263,14 @@ and two config keys.
 - Startup, warm process start-to-exit: release `--version` ≈24–32 ms —
   unchanged; the REPL builds per bare invocation and costs nothing
   at startup.
+
+## Phase 5 delta (measured, informational)
+
+Same host and caveats as above. One new crate (`aurel-tools`) with zero
+third-party dependencies, plus session instructions plumbing and CLI
+wiring — no new crates.io graph entries at all.
+
+- Release binary: 2,933,248 bytes (≈2.80 MiB), i.e. +12,288 bytes
+  (+0.4%) vs Phase 4. Still far under the < 15 MB Core target.
+- Startup, warm process start-to-exit: release `--version` ≈26–31 ms —
+  unchanged; tools and instructions load lazily per invocation.

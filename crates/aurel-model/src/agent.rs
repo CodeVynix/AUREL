@@ -100,12 +100,15 @@ impl Default for AgentConfig {
 /// In-memory conversation history for one agent session. No persistence
 /// (sessions are Phase 8); dropped with the process.
 ///
-/// Also carries the interaction [`Mode`]: `/new` (via [`AgentSession::clear`])
-/// resets history but preserves the mode.
+/// Also carries the interaction [`Mode`] and optional project instructions
+/// (`AGENTS.md` content): `/new` (via [`AgentSession::clear`]) resets
+/// history but preserves the mode. Instructions are *not* history —
+/// [`Agent::run`] prepends them to each request without storing them.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct AgentSession {
     history: Vec<Message>,
     mode: Mode,
+    instructions: Option<String>,
 }
 
 impl AgentSession {
@@ -113,6 +116,7 @@ impl AgentSession {
         AgentSession {
             history: Vec::new(),
             mode: Mode::default(),
+            instructions: None,
         }
     }
 
@@ -124,7 +128,8 @@ impl AgentSession {
         self.history.push(message);
     }
 
-    /// Drop history but keep the interaction mode.
+    /// Drop history but keep the interaction mode (and instructions, which
+    /// describe the project rather than the conversation).
     pub fn clear(&mut self) {
         self.history.clear();
     }
@@ -135,6 +140,17 @@ impl AgentSession {
 
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
+    }
+
+    /// Project instructions (`AGENTS.md` content) for every run on this
+    /// session. Sent as a leading `system` message per request, never
+    /// stored in [`AgentSession::history`].
+    pub fn set_instructions(&mut self, instructions: Option<String>) {
+        self.instructions = instructions;
+    }
+
+    pub fn instructions(&self) -> Option<&str> {
+        self.instructions.as_deref()
     }
 }
 
@@ -255,8 +271,16 @@ impl<P: ModelProvider> Agent<P> {
             if cancel.as_ref().is_some_and(|flag| flag.is_cancelled()) {
                 return AgentOutcome::Cancelled(result);
             }
+            // Project instructions ride along as a leading `system` message
+            // on every request, including continuations — without ever
+            // entering `session.history`.
+            let mut messages = Vec::with_capacity(session.history.len() + 1);
+            if let Some(instructions) = session.instructions() {
+                messages.push(Message::system(instructions));
+            }
+            messages.extend(session.history.iter().cloned());
             let request = ChatRequest {
-                messages: session.history.clone(),
+                messages,
                 stream: self.config.streaming,
                 cancel: cancel.cloned(),
             };
@@ -421,11 +445,13 @@ mod tests {
     use std::collections::VecDeque;
 
     /// Scripted provider double: each call consumes the next scripted
-    /// outcome; running dry is a test bug (panics).
+    /// outcome; running dry is a test bug (panics). Records every received
+    /// message list so tests can assert on request context.
     struct ScriptedProvider {
         script: std::cell::RefCell<VecDeque<Result<ChatResponse, ProviderError>>>,
         calls: Cell<usize>,
         events: Cell<usize>,
+        seen: std::cell::RefCell<Vec<Vec<Message>>>,
     }
 
     impl ScriptedProvider {
@@ -434,6 +460,7 @@ mod tests {
                 script: std::cell::RefCell::new(script.into()),
                 calls: Cell::new(0),
                 events: Cell::new(0),
+                seen: std::cell::RefCell::new(Vec::new()),
             }
         }
 
@@ -478,6 +505,7 @@ mod tests {
             {
                 return Err(ProviderError::Cancelled);
             }
+            self.seen.borrow_mut().push(request.messages.clone());
             self.script
                 .borrow_mut()
                 .pop_front()
@@ -497,6 +525,7 @@ mod tests {
             {
                 return Err(ProviderError::Cancelled);
             }
+            self.seen.borrow_mut().push(request.messages.clone());
             let response = self
                 .script
                 .borrow_mut()
@@ -885,6 +914,50 @@ mod tests {
         session.set_mode(Mode::Plan);
         let outcome = agent.run(&mut session, "hi", None, &mut sink());
         assert_eq!(outcome.result().mode, Mode::Plan);
+    }
+
+    #[test]
+    fn instructions_ride_alongside_history() {
+        let (agent, mut session) = agent(vec![ScriptedProvider::reply(
+            "done",
+            Some(FinishReason::Stop),
+        )]);
+        session.set_instructions(Some("Be terse.".to_string()));
+        let outcome = agent.run(&mut session, "hi", None, &mut sink());
+        assert!(matches!(outcome, AgentOutcome::Completed(_)));
+        // The provider saw a leading system message ahead of the history.
+        let seen = agent.provider().seen.borrow();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].len(), 2);
+        assert_eq!(seen[0][0].role, crate::Role::System);
+        assert_eq!(seen[0][0].content, "Be terse.");
+        assert_eq!(seen[0][1].content, "hi");
+        // History itself holds no trace of the instructions.
+        assert_eq!(session.history().len(), 2);
+        assert!(session
+            .history()
+            .iter()
+            .all(|message| message.content != "Be terse."));
+    }
+
+    #[test]
+    fn btw_carries_instructions_without_touching_history() {
+        let (agent, mut session) = agent(vec![
+            ScriptedProvider::reply("main", Some(FinishReason::Stop)),
+            ScriptedProvider::reply("side", Some(FinishReason::Stop)),
+        ]);
+        session.set_instructions(Some("Be terse.".to_string()));
+        agent.run(&mut session, "main task", None, &mut sink());
+        agent
+            .run_btw(&session, "side question", None, &mut sink())
+            .result();
+        let seen = agent.provider().seen.borrow();
+        assert_eq!(seen.len(), 2);
+        for request in seen.iter() {
+            assert_eq!(request[0].role, crate::Role::System);
+            assert_eq!(request[0].content, "Be terse.");
+        }
+        assert_eq!(session.history().len(), 2);
     }
 
     fn history_with_pairs(n: usize) -> AgentSession {

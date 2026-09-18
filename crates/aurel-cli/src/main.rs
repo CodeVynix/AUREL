@@ -35,7 +35,7 @@ mod interactive;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use args::{Command, HelpTopic};
@@ -624,7 +624,27 @@ fn execute_agent(
             return EXIT_RUNTIME_ERROR;
         }
     };
-    run_agent(&agent, message, out, err)
+    let mut session = AgentSession::new();
+    load_session_instructions(&mut session, &rt.cwd, err);
+    run_agent(&agent, &mut session, message, out, err)
+}
+
+/// Load the nearest `AGENTS.md` above `cwd` into the session as project
+/// instructions (kept out of conversation history). Absent files clear any
+/// value; load failures warn and continue bare — instructions must never
+/// fail a run on their own.
+fn load_session_instructions(session: &mut AgentSession, cwd: &Path, err: &mut dyn Write) {
+    match aurel_tools::load_instructions_for_dir(cwd) {
+        Ok(found) => session.set_instructions(found.map(|loaded| loaded.content)),
+        Err(error) => {
+            session.set_instructions(None);
+            let _ = writeln!(
+                err,
+                "warning: could not load {}: {error} (continuing)",
+                aurel_tools::AGENTS_MD
+            );
+        }
+    }
 }
 
 /// Drive one agent run against any provider and print the outcome.
@@ -636,15 +656,15 @@ fn execute_agent(
 /// behavior, instead of a misleading cancellation or provider error.
 fn run_agent<P: ModelProvider>(
     agent: &Agent<P>,
+    session: &mut AgentSession,
     message: &str,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
     let streaming = agent.config().streaming;
     let cancel = CancelFlag::new();
-    let mut session = AgentSession::new();
     let mut sink = StreamSink::new(out);
-    let outcome = agent.run(&mut session, message, Some(&cancel), &mut |event| {
+    let outcome = agent.run(session, message, Some(&cancel), &mut |event| {
         sink.on_event(event)
     });
     let failed = sink.failed;
@@ -1193,7 +1213,8 @@ mod tests {
             writes: std::cell::Cell::new(0),
         };
         let mut err = Vec::new();
-        let code = run_agent(&agent, "hi", &mut out, &mut err);
+        let mut session = AgentSession::new();
+        let code = run_agent(&agent, &mut session, "hi", &mut out, &mut err);
         assert_eq!(code, EXIT_RUNTIME_ERROR);
         assert!(
             agent.provider().offered.get() < 10,

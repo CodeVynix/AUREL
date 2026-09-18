@@ -70,13 +70,13 @@ plan> hello
 Actual `--version` output:
 
 ```text
-aurel 0.5.0
+aurel 0.6.0
 ```
 
 Actual `--help` output:
 
 ```text
-aurel 0.5.0
+aurel 0.6.0
 Autonomous Utility & Reasoning Engine for Logic
 
 USAGE:
@@ -114,7 +114,7 @@ Behavior:
 | ---------- | --------- | ------ |
 | `aurel` | 0 | help to stdout (config files untouched) |
 | `aurel --help` / `-h` | 0 | help to stdout |
-| `aurel --version` / `-V` | 0 | `aurel 0.5.0` to stdout |
+| `aurel --version` / `-V` | 0 | `aurel 0.6.0` to stdout |
 | `aurel config show` | 0 | effective config as TOML to stdout (key redacted) |
 | `aurel config` / `aurel config --help` | 0 | command help to stdout |
 | `aurel chat "hi"` | 0 | model reply to stdout |
@@ -171,14 +171,40 @@ one-shot (`aurel agent "hi"`, `aurel chat "hi"`, `aurel config show`).
 | `/new` | Fresh session (mode preserved) |
 | `/settings [show\|set auto_compaction on\|off]` | Session-scoped settings |
 | `/config` | Effective config (key redacted) |
-| `/model`, `/tools` | Honestly report unimplemented backends |
+| `/model` | Honestly reports its backend is unimplemented |
+| `/tools` | List registered tools (all read-only in this phase) |
+| `/init [--force]` | Create `AGENTS.md` starter (never overwrites silently) |
 | `@general`, `@explore` | Prompt scope (`@explore` notes cross-session is future) |
 | `!command` | Parsed only — shell execution is not implemented yet |
+| blank line | Prints the input hint, then reprompts |
 | `/exit`, `/quit`, Ctrl-D | Leave the loop |
 
 Plan mode reasons and proposes but must not mutate (`Mode::allows_mutation`
 is the gate future tools must check). Auto-compaction is on by default
 (threshold 20 messages, keeps 4); toggle per session via `/settings`.
+
+## Read-only tools
+
+Four inspection tools share one workspace sandbox (traversal, absolute
+escapes, and symlink breakouts are rejected; everything is bounded):
+
+| Tool | Does |
+| ---- | ---- |
+| `read_file` | Read a text file with line offset/limit |
+| `list_dir` | List entries, optionally recursive to a bounded depth |
+| `stat` | Kind, size, and modification time of one path |
+| `search` | Substring search over text files (skips `.git`/`target`/binaries) |
+
+List them at runtime with `/tools`. They read only: no writes, no shell,
+no Git mutations, no hidden access.
+
+## Project instructions (`AGENTS.md`)
+
+`/init` writes a starter `AGENTS.md` into the working directory — only
+when absent, or with explicit `/init --force`. Every agent run
+(one-shot or interactive) loads the nearest `AGENTS.md` above the working
+directory and sends it as a leading `system` message; conversation
+history never stores it. Oversized files truncate with a marker.
 
 ## Test
 
@@ -203,6 +229,7 @@ Cargo.toml                  # workspace (resolver 2) + shared [workspace.package
 crates/aurel-core/          # shared library foundation (version API)
 crates/aurel-config/        # TOML loading, precedence, discovery, config errors
 crates/aurel-model/         # provider abstraction + OpenAI-compatible provider + agent loop
+crates/aurel-tools/         # read-only inspection tools + AGENTS.md instructions (zero deps)
 crates/aurel-cli/           # `aurel` binary: std-only arg parser + dispatch + interactive loop
 docs/architecture.md        # what the current phase actually contains
 docs/configuration.md      # config precedence, grammar, errors
