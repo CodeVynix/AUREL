@@ -16,6 +16,7 @@
 mod command;
 mod context;
 mod error;
+mod git;
 mod instructions;
 mod mutation;
 
@@ -28,6 +29,9 @@ pub use context::{
     SearchOptions, SearchResults, ToolContext, ToolInfo,
 };
 pub use error::ToolError;
+pub use git::{
+    git_binary, GitBranch, GitDiff, GitKind, GitLogEntry, GitOp, GitResolved, GitStatus,
+};
 pub use instructions::{
     discover_agents_md, init_agents_md, load_agents_md, load_instructions_for_dir,
     starter_template, InitOutcome, ProjectInstructions, AGENTS_MD, MAX_INSTRUCTIONS_BYTES,

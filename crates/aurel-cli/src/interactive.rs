@@ -87,6 +87,9 @@ pub enum SlashCommand {
     },
     /// Re-show the pending proposal diff.
     Diff,
+    /// Read-only local Git inspection (`/git status|diff|branches|log`).
+    /// Never mutates; allowed in both Plan and Build modes.
+    Git(GitAction),
     /// Reverse the last AUREL-applied change.
     Undo,
     Exit,
@@ -100,6 +103,16 @@ pub enum SettingsAction {
     Show,
     SetAutoCompaction(bool),
     Invalid(String),
+}
+
+/// `/git` read-only inspection actions. All local, all read-only — the
+/// mutating half of Git lives in the proposal queue, never here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitAction {
+    Status,
+    Diff { staged: bool },
+    Branches,
+    Log { limit: u32 },
 }
 
 /// Parse one raw input line. Total and deterministic: every shape maps to
@@ -195,9 +208,29 @@ fn parse_slash(rest: &str) -> SlashCommand {
             },
         },
         "diff" => SlashCommand::Diff,
+        "git" => parse_git(args),
         "undo" => SlashCommand::Undo,
         "exit" | "quit" => SlashCommand::Exit,
         _ => SlashCommand::Unknown(name.to_string()),
+    }
+}
+
+/// Parse `/git` arguments. Total: every shape maps to exactly one outcome;
+/// anything unrecognized becomes `Unknown` so dispatch reports the standard
+/// unknown-command error instead of guessing.
+fn parse_git(args: &str) -> SlashCommand {
+    let words: Vec<&str> = args.split_whitespace().collect();
+    match words.as_slice() {
+        [] | ["status"] => SlashCommand::Git(GitAction::Status),
+        ["diff"] => SlashCommand::Git(GitAction::Diff { staged: false }),
+        ["diff", "--staged"] => SlashCommand::Git(GitAction::Diff { staged: true }),
+        ["branches"] => SlashCommand::Git(GitAction::Branches),
+        ["log"] => SlashCommand::Git(GitAction::Log { limit: 10 }),
+        ["log", count] => match count.parse::<u32>() {
+            Ok(limit) if (1..=50).contains(&limit) => SlashCommand::Git(GitAction::Log { limit }),
+            _ => SlashCommand::Unknown(format!("git {args}")),
+        },
+        _ => SlashCommand::Unknown(format!("git {args}")),
     }
 }
 
@@ -400,6 +433,10 @@ impl<P: ModelProvider> Repl<P> {
             }
             SlashCommand::Diff => {
                 self.run_diff(out);
+                true
+            }
+            SlashCommand::Git(action) => {
+                self.run_git_action(action, out, err);
                 true
             }
             SlashCommand::Undo => {
@@ -607,9 +644,14 @@ impl<P: ModelProvider> Repl<P> {
         let redact = self.config.model.api_key.clone();
         match context.apply_mutation(&proposal.op, redact.as_deref(), None) {
             Ok((change, output)) => {
+                let is_git = matches!(change, AppliedChange::GitExecuted { .. });
                 self.undo_stack.push(change);
                 if let Some(result) = output {
-                    print_command_result(&result, out);
+                    if is_git {
+                        print_git_result(&result, out);
+                    } else {
+                        print_command_result(&result, out);
+                    }
                 }
                 let _ = writeln!(out, "Applied proposal #{}.", proposal.id);
             }
@@ -652,6 +694,100 @@ impl<P: ModelProvider> Repl<P> {
             None => {
                 let _ = writeln!(out, "No pending proposals.");
             }
+        }
+    }
+
+    /// Read-only local Git inspection. Allowed in every mode — nothing
+    /// here stages, commits, branches, or touches remotes; the mutating
+    /// half of Git lives in the proposal queue and needs `/approve`.
+    fn run_git_action(&self, action: &GitAction, out: &mut dyn Write, err: &mut dyn Write) {
+        let context = match self.tools() {
+            Ok(context) => context,
+            Err(error) => {
+                let _ = writeln!(err, "error: cannot inspect git state: {error}");
+                return;
+            }
+        };
+        match action {
+            GitAction::Status => match context.git_status(None) {
+                Ok(status) => {
+                    let _ = writeln!(out, "branch: {}", status.branch);
+                    if let (Some(ahead), Some(behind)) = (status.ahead, status.behind) {
+                        let _ = writeln!(out, "upstream: ahead {ahead}, behind {behind}");
+                    } else if let Some(ahead) = status.ahead {
+                        let _ = writeln!(out, "upstream: ahead {ahead}");
+                    } else if let Some(behind) = status.behind {
+                        let _ = writeln!(out, "upstream: behind {behind}");
+                    }
+                    if status.unborn {
+                        let _ = writeln!(out, "(no commits yet)");
+                    }
+                    print_git_paths(out, "staged", &status.staged);
+                    print_git_paths(out, "unstaged", &status.unstaged);
+                    print_git_paths(out, "untracked", &status.untracked);
+                    if status.is_clean() {
+                        let _ = writeln!(out, "clean.");
+                    }
+                }
+                Err(error) => {
+                    let _ = writeln!(err, "{error}");
+                }
+            },
+            GitAction::Diff { staged } => match context.git_diff(*staged, None) {
+                Ok(diff) => {
+                    if diff.staged {
+                        let _ = writeln!(out, "staged changes (index vs HEAD):");
+                    } else {
+                        let _ = writeln!(out, "unstaged changes (worktree vs index):");
+                    }
+                    if diff.text.trim().is_empty() {
+                        let _ = writeln!(out, "(no changes)");
+                    } else {
+                        let _ = write!(out, "{}", diff.text);
+                        if !diff.text.ends_with('\n') {
+                            let _ = writeln!(out);
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = writeln!(err, "{error}");
+                }
+            },
+            GitAction::Branches => match context.git_branches(None) {
+                Ok(branches) => {
+                    if branches.is_empty() {
+                        let _ = writeln!(out, "No local branches.");
+                    }
+                    for branch in branches {
+                        let marker = if branch.current { '*' } else { ' ' };
+                        if branch.subject.is_empty() {
+                            let _ = writeln!(out, "{marker} {} {}", branch.name, branch.short_oid);
+                        } else {
+                            let _ = writeln!(
+                                out,
+                                "{marker} {} {} {}",
+                                branch.name, branch.short_oid, branch.subject
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = writeln!(err, "{error}");
+                }
+            },
+            GitAction::Log { limit } => match context.git_log(*limit, None) {
+                Ok(entries) => {
+                    if entries.is_empty() {
+                        let _ = writeln!(out, "No commits yet.");
+                    }
+                    for entry in entries {
+                        let _ = writeln!(out, "{} {}", entry.short_oid, entry.subject);
+                    }
+                }
+                Err(error) => {
+                    let _ = writeln!(err, "{error}");
+                }
+            },
         }
     }
 
@@ -951,6 +1087,68 @@ fn print_command_result(result: &aurel_tools::CommandResult, out: &mut dyn Write
     }
 }
 
+/// Print one path list of `/git status` (`(none)` keeps empty sections
+/// explicit instead of silently absent).
+fn print_git_paths(out: &mut dyn Write, label: &str, paths: &[String]) {
+    if paths.is_empty() {
+        let _ = writeln!(out, "{label}: (none)");
+        return;
+    }
+    let _ = writeln!(out, "{label}:");
+    for path in paths {
+        let _ = writeln!(out, "  {path}");
+    }
+}
+
+/// Print an approved local Git operation result: the same verdict shape as
+/// shell results, labeled as Git, with the local-only boundary restated so
+/// local and remote operations are never confused.
+fn print_git_result(result: &aurel_tools::CommandResult, out: &mut dyn Write) {
+    use aurel_tools::CommandStatus;
+    match result.status {
+        CommandStatus::Success => {
+            let _ = writeln!(out, "Git exited 0 (local operation; remotes untouched).");
+        }
+        CommandStatus::NonZeroExit => {
+            let _ = writeln!(
+                out,
+                "Git failed with exit code {} (local operation; remotes untouched).",
+                result
+                    .exit_code
+                    .map(|code| code.to_string())
+                    .as_deref()
+                    .unwrap_or("?")
+            );
+        }
+        CommandStatus::Timeout => {
+            let _ = writeln!(out, "Git timed out ({}).", result.detail);
+        }
+        CommandStatus::Cancelled => {
+            let _ = writeln!(out, "Git operation cancelled.");
+        }
+        CommandStatus::LaunchFailed => {
+            let _ = writeln!(out, "Git failed to start: {}.", result.detail);
+        }
+    }
+    if !result.stdout.is_empty() {
+        let _ = writeln!(out, "--- git stdout ---");
+        let _ = write!(out, "{}", result.stdout);
+        if !result.stdout.ends_with('\n') {
+            let _ = writeln!(out);
+        }
+    }
+    if !result.stderr.is_empty() {
+        let _ = writeln!(out, "--- git stderr ---");
+        let _ = write!(out, "{}", result.stderr);
+        if !result.stderr.ends_with('\n') {
+            let _ = writeln!(out);
+        }
+    }
+    if result.truncated {
+        let _ = writeln!(out, "(output truncated to the per-stream cap)");
+    }
+}
+
 /// Parse fenced mutation blocks out of model output, prepare each against
 /// the workspace (resolve, snapshot, diff), print problems and diffs, and
 /// return the queueable proposals with fresh ids. Pure coordination over
@@ -1094,9 +1292,11 @@ Commands (local — never sent to the model):
   /config               Show effective configuration (key redacted)
   /tools                List registered tools (all read-only in this phase)
   /init [--force]       Create AGENTS.md starter (never overwrites silently)
-  /approve [#id]        Apply the pending proposal (Build mode only)
-  /deny [#id]           Drop the pending proposal without executing
-  /diff                 Re-show the pending proposal diff
+   /approve [#id]        Apply the pending proposal (Build mode only)
+   /deny [#id]           Drop the pending proposal without executing
+   /diff                 Re-show the pending proposal diff
+   /git <status|diff|branches|log>
+                         Inspect the workspace Git repo (read-only, local only)
   /undo                 Reverse the last AUREL-applied change
   /exit | /quit         Leave the loop
 @general / @explore prefix one prompt with a context scope.
@@ -2080,5 +2280,399 @@ mod tests {
             ..base.clone()
         };
         assert!(rendered(&clipped).contains("truncated"));
+    }
+
+    // -- Phase 8: Git ------------------------------------------------------
+
+    fn git_workdir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("aurel-git-repl-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test workdir");
+        dir
+    }
+
+    fn git_bin_or_skip() -> Option<PathBuf> {
+        aurel_tools::git_binary().ok()
+    }
+
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let git = git_bin_or_skip().expect("git fixture present");
+        let status = std::process::Command::new(&git)
+            .args(args)
+            .current_dir(dir)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    /// A repo workdir with repo-local identity and one commit. `None` when
+    /// `git` is missing: tests skip instead of failing on thin machines.
+    fn git_repo_workdir(name: &str) -> Option<PathBuf> {
+        git_bin_or_skip()?;
+        let dir = git_workdir(name);
+        run_git(&dir, &["init"]);
+        run_git(&dir, &["config", "user.email", "aurel-test@example.com"]);
+        run_git(&dir, &["config", "user.name", "Aurel Test"]);
+        // Closed before git runs (see the `aurel-tools` fixture note about
+        // open handles staging empty blobs on Windows).
+        std::fs::write(dir.join("seed.txt"), b"seed\n").expect("seed");
+        run_git(&dir, &["add", "--", "seed.txt"]);
+        run_git(&dir, &["commit", "-m", "seed commit"]);
+        Some(dir)
+    }
+
+    fn tool_status(dir: &std::path::Path) -> aurel_tools::GitStatus {
+        aurel_tools::ToolContext::new(dir)
+            .expect("context builds")
+            .git_status(None)
+            .expect("status reads")
+    }
+
+    #[test]
+    fn parses_git_command_shapes() {
+        use SlashCommand::*;
+        assert_eq!(
+            parse_input_line("/git"),
+            InputKind::Slash(Git(GitAction::Status))
+        );
+        assert_eq!(
+            parse_input_line("/git status"),
+            InputKind::Slash(Git(GitAction::Status))
+        );
+        assert_eq!(
+            parse_input_line("/git diff"),
+            InputKind::Slash(Git(GitAction::Diff { staged: false }))
+        );
+        assert_eq!(
+            parse_input_line("/git diff --staged"),
+            InputKind::Slash(Git(GitAction::Diff { staged: true }))
+        );
+        assert_eq!(
+            parse_input_line("/git branches"),
+            InputKind::Slash(Git(GitAction::Branches))
+        );
+        assert_eq!(
+            parse_input_line("/git log"),
+            InputKind::Slash(Git(GitAction::Log { limit: 10 }))
+        );
+        assert_eq!(
+            parse_input_line("/git log 5"),
+            InputKind::Slash(Git(GitAction::Log { limit: 5 }))
+        );
+        // Out-of-range limits and remote-flavored verbs never parse: there
+        // is no remote surface to reach through `/git`.
+        for bad in [
+            "/git log 0",
+            "/git log 51",
+            "/git log many",
+            "/git push",
+            "/git pull",
+            "/git fetch",
+            "/git merge",
+            "/git frobnicate",
+            "/git diff --stat",
+        ] {
+            assert!(
+                matches!(parse_input_line(bad), InputKind::Slash(Unknown(_))),
+                "{bad} must be an unknown command"
+            );
+        }
+    }
+
+    #[test]
+    fn git_inspection_is_read_only_and_plan_safe() {
+        let Some(dir) = git_repo_workdir("inspect") else {
+            return;
+        };
+        let mut repl = test_repl_in(vec![], dir.clone());
+        repl.session.set_mode(Mode::Plan);
+
+        let (cont, out, _) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Git(GitAction::Status)),
+        );
+        assert!(cont);
+        assert!(out.contains("branch:"), "got: {out:?}");
+        assert!(out.contains("staged: (none)"), "got: {out:?}");
+        assert!(out.contains("clean."), "got: {out:?}");
+
+        let (cont, out, _) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Git(GitAction::Branches)),
+        );
+        assert!(cont);
+        assert!(out.contains('*'), "current branch must be marked: {out:?}");
+
+        let (cont, out, _) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Git(GitAction::Log { limit: 5 })),
+        );
+        assert!(cont);
+        assert!(out.contains("seed commit"), "got: {out:?}");
+
+        let (cont, out, _) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Git(GitAction::Diff { staged: false })),
+        );
+        assert!(cont);
+        assert!(out.contains("(no changes)"), "got: {out:?}");
+
+        // Inspection queued nothing and recorded nothing.
+        assert!(repl.pending.is_empty());
+        assert!(repl.undo_stack.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_stage_propose_review_approve_flow() {
+        let Some(dir) = git_repo_workdir("stage-flow") else {
+            return;
+        };
+        std::fs::write(dir.join("work.txt"), b"v1\n").expect("write");
+        let reply = fence(r#"{"op": "git_stage", "paths": ["work.txt"]}"#);
+        let mut repl = test_repl_in(vec![ScriptedProvider::reply(&reply)], dir.clone());
+
+        let (cont, out, _) = dispatch_to_string(&mut repl, &prompt("stage it".into()));
+        assert!(cont);
+        assert!(out.contains("Proposal #1: git stage"), "got: {out:?}");
+        assert!(out.contains("never touches remotes"), "got: {out:?}");
+        assert!(out.contains("git add"), "got: {out:?}");
+        assert_eq!(repl.pending.len(), 1);
+        // Proposal never self-executes.
+        assert!(tool_status(&dir).staged.is_empty());
+
+        // /diff re-shows the exact argv under review.
+        let (cont, out, _) = dispatch_to_string(&mut repl, &InputKind::Slash(SlashCommand::Diff));
+        assert!(cont);
+        assert!(
+            out.contains("git add") && out.contains("work.txt"),
+            "got: {out:?}"
+        );
+
+        let (cont, out, _) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Approve { id: None }),
+        );
+        assert!(cont);
+        assert!(out.contains("Applied proposal #1"), "got: {out:?}");
+        assert!(out.contains("Git exited 0"), "got: {out:?}");
+        assert!(out.contains("remotes untouched"), "got: {out:?}");
+        assert_eq!(tool_status(&dir).staged, vec!["work.txt".to_string()]);
+        assert!(repl.pending.is_empty());
+        assert_eq!(repl.undo_stack.len(), 1);
+
+        // Git effects stand: undo is honestly refused, never a rewrite.
+        let (cont, _, err) = dispatch_to_string(&mut repl, &InputKind::Slash(SlashCommand::Undo));
+        assert!(cont);
+        assert!(err.contains("cannot undo"), "got: {err:?}");
+        assert!(err.contains("never rewrites history"), "got: {err:?}");
+        assert_eq!(tool_status(&dir).staged, vec!["work.txt".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_plan_mode_blocks_approval_but_allows_inspection() {
+        let Some(dir) = git_repo_workdir("plan-block") else {
+            return;
+        };
+        std::fs::write(dir.join("held.txt"), b"h\n").expect("write");
+        let reply = fence(r#"{"op": "git_stage", "paths": ["held.txt"]}"#);
+        let mut repl = test_repl_in(vec![ScriptedProvider::reply(&reply)], dir.clone());
+        repl.session.set_mode(Mode::Plan);
+
+        let (cont, out, _) = dispatch_to_string(&mut repl, &prompt("stage it".into()));
+        assert!(cont);
+        assert!(out.contains("Proposal #1"), "got: {out:?}");
+        assert!(out.contains("Plan mode"), "got: {out:?}");
+        assert_eq!(repl.pending.len(), 1);
+        assert!(tool_status(&dir).staged.is_empty());
+
+        let (cont, _, err) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Approve { id: None }),
+        );
+        assert!(cont);
+        assert!(err.contains("Plan"), "got: {err:?}");
+        assert_eq!(repl.pending.len(), 1);
+        assert!(tool_status(&dir).staged.is_empty());
+
+        // Read-only inspection still answers in Plan mode.
+        let (cont, out, _) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Git(GitAction::Status)),
+        );
+        assert!(cont);
+        assert!(out.contains("untracked:"), "got: {out:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_deny_drops_without_executing() {
+        let Some(dir) = git_repo_workdir("deny") else {
+            return;
+        };
+        std::fs::write(dir.join("drop.txt"), b"d\n").expect("write");
+        let reply = fence(r#"{"op": "git_stage", "paths": ["drop.txt"]}"#);
+        let mut repl = test_repl_in(vec![ScriptedProvider::reply(&reply)], dir.clone());
+        dispatch_to_string(&mut repl, &prompt("stage it".into()));
+        assert_eq!(repl.pending.len(), 1);
+
+        let (cont, out, _) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Deny { id: None }),
+        );
+        assert!(cont);
+        assert!(out.contains("Denied proposal #1"), "got: {out:?}");
+        assert!(repl.pending.is_empty());
+        assert!(tool_status(&dir).staged.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_stale_proposal_dropped_at_approve() {
+        let Some(dir) = git_repo_workdir("stale") else {
+            return;
+        };
+        std::fs::write(dir.join("a.txt"), b"a\n").expect("write");
+        let reply = fence(r#"{"op": "git_stage", "paths": ["a.txt"]}"#);
+        let mut repl = test_repl_in(vec![ScriptedProvider::reply(&reply)], dir.clone());
+        dispatch_to_string(&mut repl, &prompt("stage it".into()));
+        assert_eq!(repl.pending.len(), 1);
+
+        // External Git activity behind the proposal's back.
+        std::fs::write(dir.join("b.txt"), b"b\n").expect("write");
+        run_git(&dir, &["add", "--", "b.txt"]);
+
+        let (cont, _, err) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Approve { id: None }),
+        );
+        assert!(cont);
+        assert!(err.contains("stale proposal #1"), "got: {err:?}");
+        assert!(repl.pending.is_empty());
+        assert!(repl.undo_stack.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_commit_and_branch_flows() {
+        let Some(dir) = git_repo_workdir("commit-branch") else {
+            return;
+        };
+        std::fs::write(dir.join("work.txt"), b"v1\n").expect("write");
+        let stage = fence(r#"{"op": "git_stage", "paths": ["work.txt"]}"#);
+        let commit = fence(r#"{"op": "git_commit", "message": "add work"}"#);
+        let create = fence(r#"{"op": "git_create_branch", "name": "feature-a"}"#);
+        let switch = fence(r#"{"op": "git_switch_branch", "name": "feature-a"}"#);
+        let mut repl = test_repl_in(
+            vec![
+                ScriptedProvider::reply(&stage),
+                ScriptedProvider::reply(&commit),
+                ScriptedProvider::reply(&create),
+                ScriptedProvider::reply(&switch),
+            ],
+            dir.clone(),
+        );
+
+        for (step, text) in ["stage it", "commit it", "branch it", "switch it"]
+            .iter()
+            .enumerate()
+        {
+            let (cont, _, _) = dispatch_to_string(&mut repl, &prompt((*text).into()));
+            assert!(cont, "step {step} prompts");
+            let (cont, out, _) = dispatch_to_string(
+                &mut repl,
+                &InputKind::Slash(SlashCommand::Approve { id: None }),
+            );
+            assert!(cont, "step {step} approves");
+            assert!(out.contains("Applied proposal"), "step {step}: {out:?}");
+        }
+
+        let context = aurel_tools::ToolContext::new(&dir).expect("context builds");
+        let log = context.git_log(1, None).expect("log reads");
+        assert_eq!(log[0].subject, "add work");
+        let branches = context.git_branches(None).expect("branches read");
+        assert!(branches
+            .iter()
+            .any(|branch| branch.name == "feature-a" && branch.current));
+        let status = context.git_status(None).expect("status reads");
+        assert_eq!(status.branch, "feature-a");
+        assert!(status.is_clean(), "got: {status:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_outside_a_repo_reports_cleanly() {
+        let workdir = git_workdir("non-repo");
+        let mut repl = test_repl_in(vec![], workdir.clone());
+
+        let (cont, _, err) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Git(GitAction::Status)),
+        );
+        assert!(cont);
+        assert!(err.contains("not a git repository"), "got: {err:?}");
+
+        // Model-proposed Git ops in a non-repo become notes, never queue.
+        let reply = fence(r#"{"op": "git_stage", "paths": ["x.txt"]}"#);
+        repl.agent = Agent::new(
+            ScriptedProvider {
+                script: std::cell::RefCell::new(vec![ScriptedProvider::reply(&reply)].into()),
+                calls: Cell::new(0),
+                seen: std::cell::RefCell::new(Vec::new()),
+            },
+            AgentConfig {
+                max_iterations: 5,
+                streaming: false,
+            },
+        )
+        .expect("rebuild agent");
+        let (cont, _, err) = dispatch_to_string(&mut repl, &prompt("stage it".into()));
+        assert!(cont);
+        assert!(err.contains("not a git repository"), "got: {err:?}");
+        assert!(repl.pending.is_empty());
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn print_git_result_labels_locality() {
+        use aurel_tools::{CommandResult, CommandStatus};
+        fn rendered(result: &CommandResult) -> String {
+            let mut out = Vec::new();
+            print_git_result(result, &mut out);
+            String::from_utf8(out).expect("utf8")
+        }
+        let base = CommandResult {
+            program: "git".into(),
+            status: CommandStatus::Success,
+            exit_code: Some(0),
+            stdout: "Switched to branch 'x'\n".into(),
+            stderr: String::new(),
+            truncated: false,
+            duration_ms: 3,
+            detail: String::new(),
+        };
+        let text = rendered(&base);
+        assert!(text.contains("Git exited 0"), "got: {text:?}");
+        assert!(text.contains("remotes untouched"), "got: {text:?}");
+        assert!(
+            text.contains("Switched to branch"),
+            "git output must be shown: {text:?}"
+        );
+        let failed = CommandResult {
+            status: CommandStatus::NonZeroExit,
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: "nothing to commit\n".into(),
+            ..base.clone()
+        };
+        let text = rendered(&failed);
+        assert!(text.contains("exit code 1"), "got: {text:?}");
+        assert!(
+            text.contains("nothing to commit"),
+            "git errors must be shown: {text:?}"
+        );
     }
 }

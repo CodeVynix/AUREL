@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::git::{GitOp, GitResolved};
 use crate::{ToolContext, ToolError};
 
 /// Fence tag a model reply uses to propose one mutation per block:
@@ -80,6 +81,10 @@ pub enum MutationOp {
     RunBuild,
     /// Run the detected project test command.
     RunTests,
+    /// A local-only Git mutation (stage, unstage, commit, branch
+    /// create/switch). Prepared, reviewed, and approved exactly like every
+    /// other mutation; never touches remotes, never rewrites history.
+    Git(GitOp),
 }
 
 /// The same operation with absolute, sandbox-verified paths.
@@ -112,6 +117,8 @@ pub enum ResolvedOp {
         purpose: String,
         kind: CommandKind,
     },
+    /// A sandbox-resolved local Git operation (see [`GitResolved`]).
+    Git(GitResolved),
 }
 
 /// What a [`ResolvedOp::RunCommand`] is for: an ad-hoc request, or the
@@ -158,6 +165,7 @@ impl ResolvedOp {
                 }
                 summary
             }
+            ResolvedOp::Git(resolved) => resolved.summary(),
         }
     }
 
@@ -170,6 +178,11 @@ impl ResolvedOp {
             | ResolvedOp::DeleteFile { path } => vec![path],
             ResolvedOp::MovePath { from, to } => vec![from, to],
             ResolvedOp::RunCommand { workdir, .. } => vec![workdir],
+            ResolvedOp::Git(resolved) => {
+                let mut touched: Vec<&Path> = resolved.paths.iter().map(PathBuf::as_path).collect();
+                touched.push(&resolved.workdir);
+                touched
+            }
         }
     }
 }
@@ -213,6 +226,12 @@ pub enum AppliedChange {
     ShellExecuted {
         summary: String,
     },
+    /// A local Git operation completed. Effects stand: undoing one would
+    /// mean rewriting repository history, which AUREL never does
+    /// automatically.
+    GitExecuted {
+        summary: String,
+    },
 }
 
 /// A proposal that cannot be queued. Messages name paths and reasons only,
@@ -223,7 +242,7 @@ pub struct ProposalError {
 }
 
 impl ProposalError {
-    fn rejected(message: impl Into<String>) -> Self {
+    pub(crate) fn rejected(message: impl Into<String>) -> Self {
         ProposalError {
             message: message.into(),
         }
@@ -284,6 +303,24 @@ struct RunCommandOp {
     #[serde(default)]
     args: Vec<String>,
     purpose: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitPathsOp {
+    paths: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitCommitOp {
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitBranchOp {
+    name: String,
 }
 
 /// Decode one fence payload into a typed operation. Strict shapes
@@ -381,6 +418,42 @@ fn decode_op(payload: &str) -> Result<MutationOp, ProposalError> {
                 return Err(ProposalError::rejected("run_tests takes no fields"));
             }
             Ok(MutationOp::RunTests)
+        }
+        "git_stage" => {
+            let parsed: GitPathsOp = serde_json::from_value(value).map_err(|e| {
+                ProposalError::rejected(format!("bad git_stage: {}", clip(&e.to_string())))
+            })?;
+            Ok(MutationOp::Git(GitOp::Stage {
+                paths: parsed.paths,
+            }))
+        }
+        "git_unstage" => {
+            let parsed: GitPathsOp = serde_json::from_value(value).map_err(|e| {
+                ProposalError::rejected(format!("bad git_unstage: {}", clip(&e.to_string())))
+            })?;
+            Ok(MutationOp::Git(GitOp::Unstage {
+                paths: parsed.paths,
+            }))
+        }
+        "git_commit" => {
+            let parsed: GitCommitOp = serde_json::from_value(value).map_err(|e| {
+                ProposalError::rejected(format!("bad git_commit: {}", clip(&e.to_string())))
+            })?;
+            Ok(MutationOp::Git(GitOp::Commit {
+                message: parsed.message,
+            }))
+        }
+        "git_create_branch" => {
+            let parsed: GitBranchOp = serde_json::from_value(value).map_err(|e| {
+                ProposalError::rejected(format!("bad git_create_branch: {}", clip(&e.to_string())))
+            })?;
+            Ok(MutationOp::Git(GitOp::CreateBranch { name: parsed.name }))
+        }
+        "git_switch_branch" => {
+            let parsed: GitBranchOp = serde_json::from_value(value).map_err(|e| {
+                ProposalError::rejected(format!("bad git_switch_branch: {}", clip(&e.to_string())))
+            })?;
+            Ok(MutationOp::Git(GitOp::SwitchBranch { name: parsed.name }))
         }
         _ => Err(ProposalError::rejected(format!("unknown op '{op}'"))),
     }
@@ -611,6 +684,7 @@ pub fn prepare_proposal(
                 CommandKind::Test,
             )
         }
+        MutationOp::Git(op) => crate::git::prepare_git(context, id, op),
     }
 }
 
@@ -775,6 +849,12 @@ pub fn verify_fresh(
                     workdir.display()
                 )));
             }
+        }
+        ResolvedOp::Git(resolved) => {
+            // Repository state (HEAD + branch + porcelain status) must read
+            // back byte-identical; errors already carry the stale prefix,
+            // and the generic sandbox loop below re-checks every path.
+            crate::git::verify_git_fresh(context, proposal.id, &proposal.prior, resolved)?;
         }
     }
     // Sandbox once more: roots do not move, but cheap certainty beats trust.
@@ -1073,6 +1153,20 @@ impl ToolContext {
                 );
                 Ok((AppliedChange::ShellExecuted { summary }, Some(result)))
             }
+            ResolvedOp::Git(resolved) => {
+                self.recheck(&resolved.workdir)?;
+                for path in &resolved.paths {
+                    self.recheck(path)?;
+                }
+                let summary = resolved.summary();
+                let result = crate::git::apply_git_op(
+                    resolved,
+                    self.limits().max_command_secs,
+                    redact,
+                    should_cancel,
+                )?;
+                Ok((AppliedChange::GitExecuted { summary }, Some(result)))
+            }
         }
     }
 
@@ -1196,6 +1290,9 @@ impl ToolContext {
             }
             AppliedChange::ShellExecuted { summary } => Err(ToolError::NotUndoable(format!(
                 "shell execution '{summary}' already ran; its effects stand"
+            ))),
+            AppliedChange::GitExecuted { summary } => Err(ToolError::NotUndoable(format!(
+                "git operation '{summary}' already ran; local effects stand (undo never rewrites history)"
             ))),
         }
     }
@@ -1731,5 +1828,114 @@ mod tests {
         assert_eq!(output.exit_code, Some(0));
         assert!(output.stdout.contains("cargo"), "got: {:?}", output.stdout);
         assert!(matches!(change, AppliedChange::ShellExecuted { .. }));
+    }
+
+    #[test]
+    fn git_ops_parse_strictly_and_need_a_repo() {
+        // All five Git ops decode from strict shapes.
+        let cases = [
+            (r#"{"op": "git_stage", "paths": ["a.txt"]}"#, "git_stage"),
+            (
+                r#"{"op": "git_unstage", "paths": ["a.txt"]}"#,
+                "git_unstage",
+            ),
+            (r#"{"op": "git_commit", "message": "msg"}"#, "git_commit"),
+            (
+                r#"{"op": "git_create_branch", "name": "feat"}"#,
+                "git_create_branch",
+            ),
+            (
+                r#"{"op": "git_switch_branch", "name": "feat"}"#,
+                "git_switch_branch",
+            ),
+        ];
+        for (json, _) in &cases {
+            let text = format!("```aurel-mutation\n{json}\n```\n");
+            let (operations, notes) = parse_proposals(&text);
+            assert!(notes.is_empty(), "got notes: {notes:?}");
+            assert!(
+                matches!(operations.as_slice(), [MutationOp::Git(_)]),
+                "got: {operations:?}"
+            );
+        }
+        // Strict shapes: unknown fields, missing fields, and remote-shaped
+        // ops are notes, never proposals.
+        for bad in [
+            r#"{"op": "git_stage", "paths": ["a.txt"], "force": true}"#,
+            r#"{"op": "git_stage"}"#,
+            r#"{"op": "git_commit"}"#,
+            r#"{"op": "git_push", "remote": "origin"}"#,
+            r#"{"op": "git_pull"}"#,
+            r#"{"op": "git_merge", "branch": "x"}"#,
+        ] {
+            let text = format!("```aurel-mutation\n{bad}\n```\n");
+            let (operations, notes) = parse_proposals(&text);
+            assert!(operations.is_empty(), "got: {operations:?}");
+            assert_eq!(notes.len(), 1, "got: {notes:?}");
+        }
+        // Preparing any Git op outside a repository is a clean rejection.
+        let (_root, context) = context("git-needs-repo");
+        if crate::git_binary().is_err() {
+            return;
+        }
+        let err = prepare_proposal(
+            &context,
+            1,
+            MutationOp::Git(crate::GitOp::Stage {
+                paths: vec!["x.txt".into()],
+            }),
+        )
+        .expect_err("non-repo cannot prepare git ops");
+        assert!(
+            err.to_string().contains("not a git repository"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn git_apply_flows_through_apply_mutation_without_undo() {
+        if crate::git_binary().is_err() {
+            return;
+        }
+        let (root, context) = context("git-apply-path");
+        let git = crate::git_binary().expect("git present");
+        let sh = |args: &[&str]| {
+            let status = std::process::Command::new(&git)
+                .args(args)
+                .current_dir(&root)
+                .stdin(std::process::Stdio::null())
+                .status()
+                .expect("git runs");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        sh(&["init"]);
+        sh(&["config", "user.email", "aurel-test@example.com"]);
+        sh(&["config", "user.name", "Aurel Test"]);
+        std::fs::write(root.join("seed.txt"), b"seed\n").expect("seed");
+        sh(&["add", "--", "seed.txt"]);
+        sh(&["commit", "-m", "seed"]);
+        std::fs::write(root.join("via.txt"), b"v\n").expect("write");
+
+        // Prepare through the shared entry point, apply through the shared
+        // mutation path: Git ops ride the exact approval machinery files do.
+        let prepared = prepare_proposal(
+            &context,
+            1,
+            MutationOp::Git(crate::GitOp::Stage {
+                paths: vec!["via.txt".into()],
+            }),
+        )
+        .expect("stage prepares");
+        assert!(prepared.diff.contains("never touches remotes"));
+        crate::verify_fresh(&context, &prepared).expect("fresh");
+        let (change, output) = context
+            .apply_mutation(&prepared.op, None, None)
+            .expect("stage applies");
+        let output = output.expect("git ops return their result");
+        assert_eq!(output.status, crate::CommandStatus::Success);
+        assert!(matches!(change, AppliedChange::GitExecuted { .. }));
+        // Undo is honestly refused: no history rewriting, ever.
+        let err = context.undo_change(&change).expect_err("not undoable");
+        assert!(matches!(err, ToolError::NotUndoable(_)), "got: {err:?}");
     }
 }

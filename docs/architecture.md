@@ -1,6 +1,6 @@
-# AUREL Architecture — Phase 7
+# AUREL Architecture — Phase 8
 
-This document describes what Phase 7 actually contains. Nothing more.
+This document describes what Phase 8 actually contains. Nothing more.
 
 ## Workspace
 
@@ -27,8 +27,9 @@ display (`aurel_core::version()`), and the test expectations:
   (`[[bin]] name = "aurel"`). Depends on all four libraries via local path
   dependencies. Argument parsing itself is still dependency-free.
 - `crates/aurel-tools` — library crate (`aurel_tools`). Read-only
-  inspection tools plus `AGENTS.md` project instructions. Zero third-party
-  dependencies by design.
+  inspection tools, `AGENTS.md` project instructions, and the approved
+  file/shell/Git mutation layers. Only `serde`/`serde_json` beyond std,
+  used solely for parsing model-proposed mutation blocks.
 
 The root manifest is workspace-only (no root package). `Cargo.lock` is
 committed because the workspace produces a binary.
@@ -108,6 +109,13 @@ and honors cooperative cancellation. All four carry
 `Permission::ReadOnly`, valid in both Plan and Build modes — Plan forbids
 *mutation*, and nothing here mutates. Listed at runtime via `/tools`.
 
+Git repository inspection (`git_status`, `git_diff`, `git_branches`,
+`git_log`, `git_toplevel` in `crates/aurel-tools/src/git.rs`) holds the
+same read-only tier: it runs the real `git` binary through the shell
+phase's direct-spawn sandbox (workspace root as working directory,
+timeouts, output caps, cancellation, secret-filtered environment) and is
+surfaced via `/git status|diff|branches|log`, allowed in both modes.
+
 ## Project instructions (`AGENTS.md`)
 
 `/init` writes a starter `AGENTS.md` into the working directory — only
@@ -159,7 +167,46 @@ Security boundaries, stated plainly:
   distinct typed states, never one generic error.
 
 Project builds/tests resolve `Cargo.toml`, then `package.json`, `go.mod`,
-`Makefile`. No Git mutations (Phase 8).
+`Makefile`. Local Git work has its own typed layer (next section); an
+explicit `!git ...` line still queues as an ordinary shell proposal, but
+AUREL never runs remote or history-rewriting Git on its own.
+
+## Git mutations
+
+`crates/aurel-tools/src/git.rs` adds local-only Git operations on top of
+the same proposal → diff/review → explicit approval flow as files and
+shell. The model proposes five fenced ops (`git_stage`, `git_unstage`,
+`git_commit`, `git_create_branch`, `git_switch_branch`); each prepares by
+detecting the repository containing the workspace (`git rev-parse
+--show-toplevel`, canonicalized), validating (non-empty bounded paths
+resolved through the sandbox, no directory staging, non-empty bounded
+commit message with staged work present, never on a detached HEAD,
+branch names checked locally and via `git check-ref-format`, create
+refuses existing names, switch refuses unknown or current names),
+snapshotting HEAD + branch + porcelain status, and rendering a review
+block that states the local-only boundary and shows the exact `git` argv.
+`/diff` re-shows it; `/approve` re-checks Build mode, the requested id,
+and byte-identical repository state before running the exact argv through
+the shell phase's runner (secret redaction included), printing Git's own
+output labeled as a local operation; `/deny` drops; stale trees fail as
+stale. `/undo` refuses applied Git operations explicitly, because
+reversing them would mean rewriting history. Security boundaries, stated
+plainly:
+
+- Argument vectors are built from typed operations, never caller text, so
+  only `add`, `reset`, `commit`, `branch`, `switch` (plus read-only
+  `status`, `diff`, `rev-parse`, `symbolic-ref`, `check-ref-format`,
+  `log`) can execute. Push, pull, fetch, merge, rebase, remote, and clone
+  have no constructors, a runtime refusal guard, and a regression test
+  pinning the property — local and remote GitHub operations cannot be
+  confused because the remote half has no code path.
+- Stage/unstage paths obey the workspace sandbox; the repository itself
+  only needs to contain the workspace root.
+- Approval freshness covers the whole tree snapshot, not just touched
+  paths: any commit or status change between proposal and approval fails
+  closed.
+- Failures carry Git's own stdout/stderr (clipped, secret-scrubbed) as
+  typed `ToolError`s — output is never hidden.
 
 ## Interaction layer
 
@@ -344,3 +391,15 @@ crates.io graph entries, no async.
 - Startup, warm process start-to-exit: release `--version` ≈16–26 ms —
   unchanged; command state builds per approval and costs nothing
   at startup.
+
+## Phase 8 delta (measured, informational)
+
+Same host and caveats as above. One new module (`aurel-tools/src/git.rs`)
+plus five proposal ops, five inspection methods, one `/git` slash family,
+and CLI approval labeling — no new crates.io graph entries, no async.
+
+- Release binary: 3,352,064 bytes (≈3.20 MiB), i.e. +109,056 bytes
+  (+3.4%) vs Phase 7, mostly new code paths rather than dependencies.
+  Still far under the < 15 MB Core target.
+- Startup, warm process start-to-exit: release `--version` — unchanged;
+  Git state builds per inspection/approval and costs nothing at startup.

@@ -4,13 +4,15 @@ AUREL is a personal, terminal-first AI coding agent. This repository holds its
 Rust implementation, built as one shared foundation with a lightweight Core
 edition and (later) an extended Normal edition.
 
-> **Status: Phase 7 — Shell + build/test execution.** `!command` and the
-> `run_command` / `run_build` / `run_tests` proposal ops execute programs
-> directly (never a shell) behind the same explicit approval workflow as
-> file mutations: Build proposes, Plan blocks, `/approve` runs with
-> timeouts and bounded output, `/undo` honestly refuses shell effects.
-> There are still no Git mutations, no memory, no GUI, and no Normal
-> edition.
+> **Status: Phase 8 — Git mutations.** `/git status|diff|branches|log`
+> inspects the workspace repo (read-only, local only), and the
+> `git_stage` / `git_unstage` / `git_commit` / `git_create_branch` /
+> `git_switch_branch` proposal ops mutate it behind the same explicit
+> approval workflow as file mutations: Build proposes, Plan blocks,
+> `/approve` runs the exact shown `git` argv, `/undo` honestly refuses
+> (undo never rewrites history). Local operations only — no push, pull,
+> fetch, merge, remotes, or PRs. There is still no memory, no GUI, and no
+> Normal edition.
 
 ## Toolchain
 
@@ -71,13 +73,13 @@ plan> hello
 Actual `--version` output:
 
 ```text
-aurel 0.8.0
+aurel 0.9.0
 ```
 
 Actual `--help` output:
 
 ```text
-aurel 0.8.0
+aurel 0.9.0
 Autonomous Utility & Reasoning Engine for Logic
 
 USAGE:
@@ -115,7 +117,7 @@ Behavior:
 | ---------- | --------- | ------ |
 | `aurel` | 0 | help to stdout (config files untouched) |
 | `aurel --help` / `-h` | 0 | help to stdout |
-| `aurel --version` / `-V` | 0 | `aurel 0.8.0` to stdout |
+| `aurel --version` / `-V` | 0 | `aurel 0.9.0` to stdout |
 | `aurel config show` | 0 | effective config as TOML to stdout (key redacted) |
 | `aurel config` / `aurel config --help` | 0 | command help to stdout |
 | `aurel chat "hi"` | 0 | model reply to stdout |
@@ -175,8 +177,9 @@ one-shot (`aurel agent "hi"`, `aurel chat "hi"`, `aurel config show`).
 | `/model` | Honestly reports its backend is unimplemented |
 | `/tools` | List registered tools (all read-only in this phase) |
 | `/init [--force]` | Create `AGENTS.md` starter (never overwrites silently) |
-| `/approve [#id]`, `/deny [#id]` | Apply / drop the pending file mutation (Build only) |
+| `/approve [#id]`, `/deny [#id]` | Apply / drop the pending proposal (Build only) |
 | `/diff` | Re-show the pending proposal diff |
+| `/git <status|diff|branches|log>` | Inspect the workspace Git repo (read-only, local only) |
 | `/undo` | Reverse the last AUREL-applied change |
 | `@general`, `@explore` | Prompt scope (`@explore` notes cross-session is future) |
 | `!command` | Queues a shell command for approval (direct execution, no shell) |
@@ -200,7 +203,9 @@ escapes, and symlink breakouts are rejected; everything is bounded):
 | `search` | Substring search over text files (skips `.git`/`target`/binaries) |
 
 List them at runtime with `/tools`. They read only: no writes, no shell,
-no Git mutations, no hidden access.
+no hidden access. Git repository state reads through `/git status|diff|
+branches|log` (same sandbox, same read-only tier); anything that changes
+the repo needs the approval workflow below.
 
 ## File mutations + approval (Build mode)
 
@@ -231,7 +236,32 @@ file mutations.
 Shell effects cannot be undone — `/undo` says so explicitly instead of
 pretending. Project builds and tests run through the same system:
 `run_build` / `run_tests` proposals resolve `Cargo.toml`, `package.json`,
-`go.mod`, or `Makefile` in that order. No Git mutations yet (Phase 8).
+`go.mod`, or `Makefile` in that order. Local Git work has its own typed
+layer (see below); an explicit `!git ...` line still queues as an ordinary
+shell proposal showing its exact argv, but AUREL never runs remote or
+history-rewriting Git on its own.
+
+## Git mutations (Build mode, approved)
+
+`/git status` (branch, staged/unstaged/untracked, ahead/behind),
+`/git diff [--staged]`, `/git branches`, and `/git log [N]` inspect the
+repository containing the workspace — read-only, allowed in Plan and
+Build alike, over the same direct-spawn command sandbox as shell runs.
+
+In Build mode the agent may propose local Git mutations as fenced
+`aurel-mutation` blocks: `git_stage` / `git_unstage` (sandbox-resolved
+paths, directories refused for staging), `git_commit` (non-empty message,
+something staged, never on a detached HEAD), `git_create_branch`, and
+`git_switch_branch`. Every proposal shows its exact `git` argv, the repo
+it runs in, and the repository state it was taken from; `/approve`
+re-verifies HEAD + branch + status byte-identical and drops stale
+proposals instead of applying against a moved tree. Approval prints Git's
+own output and labels the run local-only. Only these five subcommands can
+ever execute (`add`, `reset`, `commit`, `branch`, `switch`, plus read-only
+inspection): push, pull, fetch, merge, rebase, remote, and clone have no
+constructors, a runtime guard, and a regression test pinning that. Applied
+Git operations are recorded for audit but never undone — `/undo` refuses,
+because undoing them would mean rewriting history.
 
 ## Project instructions (`AGENTS.md`)
 
@@ -264,7 +294,7 @@ Cargo.toml                  # workspace (resolver 2) + shared [workspace.package
 crates/aurel-core/          # shared library foundation (version API)
 crates/aurel-config/        # TOML loading, precedence, discovery, config errors
 crates/aurel-model/         # provider abstraction + OpenAI-compatible provider + agent loop
-crates/aurel-tools/         # read-only inspection tools + AGENTS.md instructions (zero deps)
+crates/aurel-tools/         # inspection + AGENTS.md + approved file/shell/Git mutations
 crates/aurel-cli/           # `aurel` binary: std-only arg parser + dispatch + interactive loop
 docs/architecture.md        # what the current phase actually contains
 docs/configuration.md      # config precedence, grammar, errors
