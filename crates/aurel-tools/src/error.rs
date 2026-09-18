@@ -25,6 +25,9 @@ pub enum ToolError {
     TooLarge { path: String, limit: String },
     /// Cooperative cancellation observed mid-walk.
     Cancelled,
+    /// An undo was requested for something that cannot be reversed (shell
+    /// executions). The detail names what stands.
+    NotUndoable(String),
     /// Filesystem I/O failure with the OS message attached.
     Io { path: String, message: String },
 }
@@ -44,6 +47,9 @@ impl fmt::Display for ToolError {
                 write!(f, "error: '{path}' exceeds the {limit} limit")
             }
             ToolError::Cancelled => write!(f, "error: tool cancelled"),
+            ToolError::NotUndoable(detail) => {
+                write!(f, "error: cannot undo: {detail}")
+            }
             ToolError::Io { path, message } => {
                 write!(f, "error: cannot access '{path}': {message}")
             }

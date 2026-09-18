@@ -13,11 +13,16 @@
 //! model-proposed mutation blocks (both already in the workspace graph).
 //! Inspection itself stays standard-library only.
 
+mod command;
 mod context;
 mod error;
 mod instructions;
 mod mutation;
 
+pub use command::{
+    detect_build_commands, resolve_program, run_command, scrub_secret, system_path_dirs,
+    BuildCommands, CommandRequest, CommandResult, CommandStatus,
+};
 pub use context::{
     tool_catalog, DirEntry, DirListing, EntryKind, FileStat, Limits, Match, Permission,
     SearchOptions, SearchResults, ToolContext, ToolInfo,
@@ -28,6 +33,7 @@ pub use instructions::{
     starter_template, InitOutcome, ProjectInstructions, AGENTS_MD, MAX_INSTRUCTIONS_BYTES,
 };
 pub use mutation::{
-    parse_proposals, prepare_proposal, render_diff, verify_fresh, AppliedChange, MutationOp,
-    PendingProposal, ProposalError, ResolvedOp, FENCE_TAG, MAX_DIFF_LINES, MAX_PROPOSALS_PER_RUN,
+    parse_proposals, prepare_proposal, render_diff, verify_fresh, AppliedChange, CommandKind,
+    MutationOp, PendingProposal, ProposalError, ResolvedOp, FENCE_TAG, MAX_DIFF_LINES,
+    MAX_PROPOSALS_PER_RUN,
 };

@@ -82,6 +82,11 @@ pub struct Limits {
     pub max_search_file_bytes: u64,
     /// Match preview lines are clipped to this many characters.
     pub max_match_line_chars: usize,
+    /// Max wall-clock time for one shell command execution.
+    pub max_command_secs: u64,
+    /// Max bytes captured per command output stream (stdout/stderr each);
+    /// the rest is drained and discarded so big output cannot deadlock.
+    pub max_command_output_bytes: usize,
 }
 
 impl Default for Limits {
@@ -94,6 +99,8 @@ impl Default for Limits {
             max_search_matches: 100,
             max_search_file_bytes: 256 * 1024,
             max_match_line_chars: 240,
+            max_command_secs: 60,
+            max_command_output_bytes: 1024 * 1024,
         }
     }
 }

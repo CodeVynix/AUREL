@@ -22,6 +22,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -68,6 +69,17 @@ pub enum MutationOp {
     DeleteFile {
         path: String,
     },
+    /// Run one program with literal arguments in the workspace.
+    /// `args` defaults to empty when omitted.
+    RunCommand {
+        program: String,
+        args: Vec<String>,
+        purpose: String,
+    },
+    /// Run the detected project build command.
+    RunBuild,
+    /// Run the detected project test command.
+    RunTests,
 }
 
 /// The same operation with absolute, sandbox-verified paths.
@@ -93,6 +105,33 @@ pub enum ResolvedOp {
     DeleteFile {
         path: PathBuf,
     },
+    RunCommand {
+        program: PathBuf,
+        args: Vec<String>,
+        workdir: PathBuf,
+        purpose: String,
+        kind: CommandKind,
+    },
+}
+
+/// What a [`ResolvedOp::RunCommand`] is for: an ad-hoc request, or the
+/// detected project build/test command. Only the label differs — approval,
+/// timeouts, output caps, and undo semantics are identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandKind {
+    AdHoc,
+    Build,
+    Test,
+}
+
+impl CommandKind {
+    fn label(self) -> &'static str {
+        match self {
+            CommandKind::AdHoc => "run",
+            CommandKind::Build => "run project build",
+            CommandKind::Test => "run project tests",
+        }
+    }
 }
 
 impl ResolvedOp {
@@ -106,6 +145,19 @@ impl ResolvedOp {
                 format!("move {} → {}", from.display(), to.display())
             }
             ResolvedOp::DeleteFile { path } => format!("delete_file {}", path.display()),
+            ResolvedOp::RunCommand {
+                program,
+                args,
+                kind,
+                ..
+            } => {
+                let mut summary = format!("{} {}", kind.label(), program.display());
+                for arg in args {
+                    summary.push(' ');
+                    summary.push_str(arg);
+                }
+                summary
+            }
         }
     }
 
@@ -117,6 +169,7 @@ impl ResolvedOp {
             | ResolvedOp::OverwriteFile { path, .. }
             | ResolvedOp::DeleteFile { path } => vec![path],
             ResolvedOp::MovePath { from, to } => vec![from, to],
+            ResolvedOp::RunCommand { workdir, .. } => vec![workdir],
         }
     }
 }
@@ -140,10 +193,26 @@ pub struct PendingProposal {
 /// Only AUREL-applied changes ever enter an undo stack.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppliedChange {
-    CreatedFile { path: PathBuf },
-    WroteFile { path: PathBuf, prior: Vec<u8> },
-    MovedPath { from: PathBuf, to: PathBuf },
-    DeletedFile { path: PathBuf, prior: Vec<u8> },
+    CreatedFile {
+        path: PathBuf,
+    },
+    WroteFile {
+        path: PathBuf,
+        prior: Vec<u8>,
+    },
+    MovedPath {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    DeletedFile {
+        path: PathBuf,
+        prior: Vec<u8>,
+    },
+    /// A shell execution completed. Effects cannot be reversed; undo
+    /// reports this honestly instead of pretending.
+    ShellExecuted {
+        summary: String,
+    },
 }
 
 /// A proposal that cannot be queued. Messages name paths and reasons only,
@@ -206,6 +275,15 @@ struct MoveOp {
 #[serde(deny_unknown_fields)]
 struct DeleteFileOp {
     path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunCommandOp {
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    purpose: String,
 }
 
 /// Decode one fence payload into a typed operation. Strict shapes
@@ -271,6 +349,38 @@ fn decode_op(payload: &str) -> Result<MutationOp, ProposalError> {
                 ProposalError::rejected(format!("bad delete_file: {}", clip(&e.to_string())))
             })?;
             Ok(MutationOp::DeleteFile { path: parsed.path })
+        }
+        "run_command" => {
+            let parsed: RunCommandOp = serde_json::from_value(value).map_err(|e| {
+                ProposalError::rejected(format!("bad run_command: {}", clip(&e.to_string())))
+            })?;
+            if parsed.program.trim().is_empty() {
+                return Err(ProposalError::rejected(
+                    "run_command 'program' must not be empty",
+                ));
+            }
+            if parsed.purpose.trim().is_empty() {
+                return Err(ProposalError::rejected(
+                    "run_command 'purpose' must not be empty (say why it should run)",
+                ));
+            }
+            Ok(MutationOp::RunCommand {
+                program: parsed.program,
+                args: parsed.args,
+                purpose: parsed.purpose,
+            })
+        }
+        "run_build" => {
+            if value.as_object().is_some_and(|map| !map.is_empty()) {
+                return Err(ProposalError::rejected("run_build takes no fields"));
+            }
+            Ok(MutationOp::RunBuild)
+        }
+        "run_tests" => {
+            if value.as_object().is_some_and(|map| !map.is_empty()) {
+                return Err(ProposalError::rejected("run_tests takes no fields"));
+            }
+            Ok(MutationOp::RunTests)
         }
         _ => Err(ProposalError::rejected(format!("unknown op '{op}'"))),
     }
@@ -464,7 +574,97 @@ pub fn prepare_proposal(
                 diff,
             })
         }
+        MutationOp::RunCommand {
+            program,
+            args,
+            purpose,
+        } => prepare_command(context, id, &program, args, purpose, CommandKind::AdHoc),
+        MutationOp::RunBuild => {
+            let detected =
+                crate::detect_build_commands(context.root()).ok_or_else(|| {
+                    ProposalError::rejected(
+                        "no supported project marker found (Cargo.toml, package.json, go.mod, Makefile)",
+                    )
+                })?;
+            prepare_command(
+                context,
+                id,
+                &detected.build_program,
+                detected.build_args,
+                format!("project build via {}", detected.kind),
+                CommandKind::Build,
+            )
+        }
+        MutationOp::RunTests => {
+            let detected =
+                crate::detect_build_commands(context.root()).ok_or_else(|| {
+                    ProposalError::rejected(
+                        "no supported project marker found (Cargo.toml, package.json, go.mod, Makefile)",
+                    )
+                })?;
+            prepare_command(
+                context,
+                id,
+                &detected.test_program,
+                detected.test_args,
+                format!("project tests via {}", detected.kind),
+                CommandKind::Test,
+            )
+        }
     }
+}
+
+/// Shared preparation for all command executions: resolve the program
+/// (PATH search, never the workspace file sandbox — program identity is
+/// controlled by approval visibility, not by file containment), pin the
+/// working directory to the workspace root, and render the review block.
+fn prepare_command(
+    context: &ToolContext,
+    id: u64,
+    program: &str,
+    args: Vec<String>,
+    purpose: String,
+    kind: CommandKind,
+) -> Result<PendingProposal, ProposalError> {
+    let program_path = crate::resolve_program(program, &crate::system_path_dirs())
+        .map_err(|e| ProposalError::rejected(format!("bad program '{program}': {e}")))?;
+    let workdir = context.root().to_path_buf();
+    let timeout = context.limits().max_command_secs;
+    let cap = context.limits().max_command_output_bytes;
+    let mut diff = format!("$ {} {}\n", program_path.display(), shell_quote_args(&args));
+    diff.push_str(&format!("cwd: {}\n", workdir.display()));
+    diff.push_str(&format!("purpose: {purpose}\n"));
+    diff.push_str(&format!(
+        "timeout: {timeout}s, output capped at {cap} bytes per stream\n"
+    ));
+    Ok(PendingProposal {
+        id,
+        op: ResolvedOp::RunCommand {
+            program: program_path,
+            args,
+            workdir,
+            purpose,
+            kind,
+        },
+        prior: None,
+        prior_is_dir: false,
+        diff,
+    })
+}
+
+/// Quote arguments for review display (single quotes with embedded-quote
+/// escaping). Display-only: execution always uses the raw argument vector.
+fn shell_quote_args(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| {
+            if arg.is_empty() || arg.chars().any(|c| c.is_whitespace() || c == '\'') {
+                format!("'{}'", arg.replace('\'', "'\\''"))
+            } else {
+                arg.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn resolve_named(context: &ToolContext, user: &str) -> Result<PathBuf, ProposalError> {
@@ -557,6 +757,22 @@ pub fn verify_fresh(
                     "move '{}' → '{}' no longer applies cleanly",
                     from.display(),
                     to.display()
+                )));
+            }
+        }
+        ResolvedOp::RunCommand {
+            program, workdir, ..
+        } => {
+            if !crate::command::is_executable_file(program) {
+                return Err(stale(format!(
+                    "program '{}' is no longer runnable",
+                    program.display()
+                )));
+            }
+            if !workdir.is_dir() {
+                return Err(stale(format!(
+                    "working directory '{}' is gone",
+                    workdir.display()
                 )));
             }
         }
@@ -723,13 +939,17 @@ fn atomic_write(dest: &Path, bytes: &[u8]) -> Result<(), ToolError> {
 impl ToolContext {
     /// Execute a prepared, approved mutation. Callers must have shown the
     /// proposal diff and received explicit approval first — this function
-    /// performs no prompting itself. Returns the inverse change for the
-    /// session undo stack.
+    /// performs no prompting itself.
+    ///
+    /// Returns the inverse change for the session undo stack, plus the
+    /// command result for shell executions (file operations print nothing
+    /// themselves, so theirs is `None`).
     pub fn apply_mutation(
         &self,
         op: &ResolvedOp,
+        redact: Option<&str>,
         should_cancel: Option<&dyn Fn() -> bool>,
-    ) -> Result<AppliedChange, ToolError> {
+    ) -> Result<(AppliedChange, Option<crate::command::CommandResult>), ToolError> {
         if should_cancel.is_some_and(|cancel| cancel()) {
             return Err(ToolError::Cancelled);
         }
@@ -745,7 +965,7 @@ impl ToolContext {
                     });
                 }
                 atomic_write(path, content.as_bytes())?;
-                Ok(AppliedChange::CreatedFile { path: path.clone() })
+                Ok((AppliedChange::CreatedFile { path: path.clone() }, None))
             }
             ResolvedOp::EditFile { path, old, new } => {
                 let prior = self.recheck_file(path)?;
@@ -760,18 +980,24 @@ impl ToolContext {
                 }
                 let after = text.replacen(old.as_str(), new, 1);
                 atomic_write(path, after.as_bytes())?;
-                Ok(AppliedChange::WroteFile {
-                    path: path.clone(),
-                    prior,
-                })
+                Ok((
+                    AppliedChange::WroteFile {
+                        path: path.clone(),
+                        prior,
+                    },
+                    None,
+                ))
             }
             ResolvedOp::OverwriteFile { path, content } => {
                 let prior = self.recheck_file(path)?;
                 atomic_write(path, content.as_bytes())?;
-                Ok(AppliedChange::WroteFile {
-                    path: path.clone(),
-                    prior,
-                })
+                Ok((
+                    AppliedChange::WroteFile {
+                        path: path.clone(),
+                        prior,
+                    },
+                    None,
+                ))
             }
             ResolvedOp::MovePath { from, to } => {
                 self.recheck(from)?;
@@ -791,10 +1017,13 @@ impl ToolContext {
                     path: format!("{} → {}", from.display(), to.display()),
                     message: e.to_string(),
                 })?;
-                Ok(AppliedChange::MovedPath {
-                    from: from.clone(),
-                    to: to.clone(),
-                })
+                Ok((
+                    AppliedChange::MovedPath {
+                        from: from.clone(),
+                        to: to.clone(),
+                    },
+                    None,
+                ))
             }
             ResolvedOp::DeleteFile { path } => {
                 let prior = self.recheck_file(path)?;
@@ -802,10 +1031,47 @@ impl ToolContext {
                     path: display_of(path),
                     message: e.to_string(),
                 })?;
-                Ok(AppliedChange::DeletedFile {
-                    path: path.clone(),
-                    prior,
-                })
+                Ok((
+                    AppliedChange::DeletedFile {
+                        path: path.clone(),
+                        prior,
+                    },
+                    None,
+                ))
+            }
+            ResolvedOp::RunCommand {
+                program,
+                args,
+                workdir,
+                purpose,
+                kind,
+            } => {
+                use crate::command::{run_command, CommandRequest};
+                self.recheck(workdir)?;
+                if !workdir.is_dir() {
+                    return Err(ToolError::NotDirectory {
+                        path: display_of(workdir),
+                    });
+                }
+                let summary = ResolvedOp::RunCommand {
+                    program: program.clone(),
+                    args: args.clone(),
+                    workdir: workdir.clone(),
+                    purpose: purpose.clone(),
+                    kind: *kind,
+                }
+                .summary();
+                let result = run_command(
+                    &CommandRequest {
+                        program: display_of(program),
+                        args: args.clone(),
+                        workdir: workdir.clone(),
+                        timeout: Duration::from_secs(self.limits().max_command_secs),
+                        redact: redact.map(str::to_string),
+                    },
+                    should_cancel,
+                );
+                Ok((AppliedChange::ShellExecuted { summary }, Some(result)))
             }
         }
     }
@@ -928,6 +1194,9 @@ impl ToolContext {
                 }
                 atomic_write(path, prior)
             }
+            AppliedChange::ShellExecuted { summary } => Err(ToolError::NotUndoable(format!(
+                "shell execution '{summary}' already ran; its effects stand"
+            ))),
         }
     }
 }
@@ -981,9 +1250,11 @@ mod tests {
     }
 
     fn apply(context: &ToolContext, proposal: &PendingProposal) -> AppliedChange {
-        context
-            .apply_mutation(&proposal.op, None)
-            .expect("apply succeeds")
+        let (change, output) = context
+            .apply_mutation(&proposal.op, None, None)
+            .expect("apply succeeds");
+        assert!(output.is_none(), "file ops produce no command output");
+        change
     }
 
     #[test]
@@ -1374,9 +1645,91 @@ mod tests {
             },
         );
         let err = context
-            .apply_mutation(&prepared.op, Some(&|| true))
+            .apply_mutation(&prepared.op, None, Some(&|| true))
             .expect_err("cancelled");
         assert_eq!(err, ToolError::Cancelled);
         assert!(!_root.join("c.txt").exists());
+    }
+
+    #[test]
+    fn run_command_ops_parse_prepare_and_execute() {
+        use crate::detect_build_commands;
+        let (root, context) = context("run-ops");
+        // Ad-hoc command proposal parses with purpose required.
+        let (operations, notes) = parse_proposals(
+            "```aurel-mutation\n{\"op\": \"run_command\", \"program\": \"cargo\", \"args\": [\"--version\"], \"purpose\": \"check toolchain\"}\n```\n",
+        );
+        assert!(notes.is_empty(), "got notes: {notes:?}");
+        assert!(matches!(
+            operations.as_slice(),
+            [MutationOp::RunCommand { .. }]
+        ));
+        let (operations, notes) = parse_proposals(
+            "```aurel-mutation\n{\"op\": \"run_command\", \"program\": \"cargo\"}\n```\n",
+        );
+        assert!(operations.is_empty());
+        assert!(
+            notes.iter().any(|note| note.contains("purpose")),
+            "got: {notes:?}"
+        );
+
+        // run_build / run_tests resolve against workspace markers.
+        let (operations, _) = parse_proposals("```aurel-mutation\n{\"op\": \"run_build\"}\n```\n");
+        assert!(matches!(operations.as_slice(), [MutationOp::RunBuild]));
+        let (operations, _) =
+            parse_proposals("```aurel-mutation\n{\"op\": \"run_tests\", \"extra\": true}\n```\n");
+        assert!(operations.is_empty(), "extra fields must be strict");
+
+        // No marker here: clean rejection, nothing queued.
+        let err = prepare_proposal(&context, 1, MutationOp::RunBuild).expect_err("no marker");
+        assert!(err.to_string().contains("no supported project marker"));
+
+        // With a marker: prepares with a reviewable diff, executes for real.
+        std::fs::write(root.join("Cargo.toml"), "[package]\n").expect("marker");
+        assert_eq!(
+            detect_build_commands(&root).expect("detected").kind,
+            "cargo"
+        );
+        let prepared = prepare(&context, 2, MutationOp::RunTests);
+        // The diff shows the resolved program plus purpose (paths vary by machine).
+        assert!(prepared.diff.contains(" test"), "got: {:?}", prepared.diff);
+        assert!(prepared.diff.contains("purpose: project tests via cargo"));
+        let (change, output) = context
+            .apply_mutation(&prepared.op, None, None)
+            .expect("cargo test --help-shaped run");
+        let output = output.expect("shell ops return their result");
+        assert!(matches!(change, AppliedChange::ShellExecuted { .. }));
+        // `cargo test` on an empty marker dir fails (no real crate), but it
+        // must fail as a typed NonZeroExit — proving execution happened.
+        assert!(matches!(output.status, crate::CommandStatus::NonZeroExit));
+        // Undoing a shell execution is honestly refused.
+        let err = context.undo_change(&change).expect_err("not undoable");
+        assert!(matches!(err, ToolError::NotUndoable(_)), "got: {err:?}");
+        assert!(err.to_string().contains("cannot undo"));
+    }
+
+    #[test]
+    fn run_command_prepares_with_displayed_review() {
+        let (_root, context) = context("run-review");
+        let prepared = prepare(
+            &context,
+            5,
+            MutationOp::RunCommand {
+                program: "cargo".into(),
+                args: vec!["--version".into()],
+                purpose: "check toolchain".into(),
+            },
+        );
+        assert!(prepared.diff.contains("check toolchain"));
+        assert!(prepared.diff.contains("cwd:"));
+        assert!(prepared.diff.contains("timeout:"));
+        let (change, output) = context
+            .apply_mutation(&prepared.op, None, None)
+            .expect("cargo --version runs");
+        let output = output.expect("shell result");
+        assert_eq!(output.status, crate::CommandStatus::Success);
+        assert_eq!(output.exit_code, Some(0));
+        assert!(output.stdout.contains("cargo"), "got: {:?}", output.stdout);
+        assert!(matches!(change, AppliedChange::ShellExecuted { .. }));
     }
 }
