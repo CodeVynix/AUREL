@@ -14,10 +14,12 @@
 //! - Program identity is resolved explicitly: absolute paths must exist;
 //!   bare names search `PATH` (plus `PATHEXT` on Windows) and skip the
 //!   current directory. What runs is always shown exactly before approval.
-//! - The environment is inherited unchanged (standard, predictable); since
-//!   no shell ever interprets arguments, values cannot smuggle expansions.
+//! - The environment is inherited minus secret variables (see
+//!   `SECRET_ENV_VARS`): ordinary variables pass through untouched
+//!   (predictable builds), credentials never do. Since no shell ever
+//!   interprets arguments, values cannot smuggle expansions either.
 //! - Captured output is scrubbed of the configured secret before it is
-//!   stored or displayed.
+//!   stored or displayed (independent second defense).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -252,8 +254,28 @@ pub fn scrub_secret(text: &str, secret: Option<&str>) -> String {
         .replace(key, "<redacted>")
 }
 
+/// Environment variables never inherited by child commands, by exact
+/// (ASCII case-insensitive) name. Only genuine secret-bearers belong here;
+/// every other variable passes through untouched so builds keep working.
+/// Output redaction stays a separate, independent defense.
+const SECRET_ENV_VARS: &[&str] = &["AUREL_API_KEY"];
+
+/// True when an environment key names a filtered secret. Byte-exact and
+/// total (no Unicode decoding involved): only an exact ASCII
+/// case-insensitive match filters, so near-misses like `AUREL_API_KEY_2`
+/// pass through.
+fn is_secret_env(key: &std::ffi::OsStr) -> bool {
+    SECRET_ENV_VARS.iter().any(|denied| {
+        key.as_encoded_bytes()
+            .eq_ignore_ascii_case(denied.as_bytes())
+    })
+}
+
 /// Run one command to completion: bounded, cancellable, secret-scrubbed.
 ///
+/// - The child environment is the parent's minus secret variables (see
+///   `SECRET_ENV_VARS`): ordinary variables pass through, credentials
+///   never do.
 /// - `stdin` is always null: commands that wait on input fail fast instead
 ///   of hanging the loop.
 /// - Output streams are pumped by scoped reader threads into capped
@@ -290,6 +312,15 @@ pub fn run_command(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Filtered inheritance: ordinary variables pass through, secrets do
+    // not. `env_clear` + explicit re-add keeps the rule total — including
+    // for odd keys `vars()`-style iteration might otherwise smuggle past.
+    command.env_clear();
+    for (key, value) in std::env::vars_os() {
+        if !is_secret_env(&key) {
+            command.env(key, value);
+        }
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -483,6 +514,88 @@ mod tests {
         );
         assert_eq!(scrub_secret("plain", None), "plain");
         assert_eq!(scrub_secret("plain", Some("")), "plain");
+    }
+
+    #[test]
+    fn secret_env_matching_is_exact_but_case_blind() {
+        use std::ffi::OsStr;
+        assert!(is_secret_env(OsStr::new("AUREL_API_KEY")));
+        assert!(is_secret_env(OsStr::new("aurel_api_key")));
+        assert!(is_secret_env(OsStr::new("Aurel_Api_Key")));
+        assert!(!is_secret_env(OsStr::new("AUREL_MODEL")));
+        assert!(!is_secret_env(OsStr::new("AUREL_API_KEY_2")));
+        assert!(!is_secret_env(OsStr::new("X_AUREL_API_KEY")));
+        assert!(!is_secret_env(OsStr::new("")));
+        assert!(!is_secret_env(OsStr::new("PATH")));
+    }
+
+    #[test]
+    fn child_env_filters_secrets_keeps_ordinary() {
+        // A command dumping its own environment proves the filter
+        // end-to-end (redact=None, so only the inheritance rule is at work).
+        // Save/restore: never clobber real developer environment entries.
+        let saved_marker = std::env::var_os("AUREL_TEST_MARKER_XYZ");
+        let saved_key = std::env::var_os("AUREL_API_KEY");
+        std::env::set_var("AUREL_TEST_MARKER_XYZ", "marker-value-123");
+        std::env::set_var("AUREL_API_KEY", "sk-test-must-not-leak");
+        let result = run_command(&env_dump_request(), None);
+        match saved_marker {
+            Some(value) => std::env::set_var("AUREL_TEST_MARKER_XYZ", value),
+            None => std::env::remove_var("AUREL_TEST_MARKER_XYZ"),
+        }
+        match saved_key {
+            Some(value) => std::env::set_var("AUREL_API_KEY", value),
+            None => std::env::remove_var("AUREL_API_KEY"),
+        }
+        assert_eq!(result.status, CommandStatus::Success, "got: {result:?}");
+        assert!(
+            result.stdout.contains("marker-value-123"),
+            "ordinary vars must pass through: {:?}",
+            &result.stdout[..result.stdout.len().min(200)]
+        );
+        assert!(
+            !result.stdout.contains("sk-test-must-not-leak"),
+            "credential leaked into child env: {:?}",
+            &result.stdout[..result.stdout.len().min(500)]
+        );
+    }
+
+    /// A request dumping the child's own environment. `env` on Unix;
+    /// `cmd /C set` on Windows with an explicitly resolved `cmd.exe`
+    /// (a builtin, not a PATH program — no shell lookup rules involved).
+    #[cfg(unix)]
+    fn env_dump_request() -> CommandRequest {
+        let program = resolve_program("env", &system_path_dirs()).expect("env fixture present");
+        CommandRequest {
+            program: program.display().to_string(),
+            args: Vec::new(),
+            workdir: std::env::temp_dir(),
+            timeout: std::time::Duration::from_secs(20),
+            redact: None,
+        }
+    }
+
+    /// A request dumping the child's own environment. `env` on Unix;
+    /// `cmd /C set` on Windows with an explicitly resolved `cmd.exe`
+    /// (a builtin, not a PATH program — no shell lookup rules involved).
+    #[cfg(windows)]
+    fn env_dump_request() -> CommandRequest {
+        let system = std::env::var("SystemRoot").unwrap_or("C:\\Windows".to_string());
+        CommandRequest {
+            program: format!("{system}\\System32\\cmd.exe"),
+            args: vec!["/C".to_string(), "set".to_string()],
+            workdir: std::env::temp_dir(),
+            timeout: std::time::Duration::from_secs(20),
+            redact: None,
+        }
+    }
+
+    /// A request dumping the child's own environment. `env` on Unix;
+    /// `cmd /C set` on Windows with an explicitly resolved `cmd.exe`
+    /// (a builtin, not a PATH program — no shell lookup rules involved).
+    #[cfg(not(any(unix, windows)))]
+    fn env_dump_request() -> CommandRequest {
+        panic!("no env-dump fixture for this platform")
     }
 
     #[test]

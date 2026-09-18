@@ -134,7 +134,32 @@ edits between proposal and approval fail as stale. Plan mode queues for
 review but its approvals are always rejected. One-shot `aurel agent`
 prints proposals and exits 1 since it cannot approve. Writes are bounded
 (256 KiB), parents must exist, destinations must be absent-or-expected,
-and errors name paths only — never contents. No shell, no Git.
+and errors name paths only — never contents.
+
+## Shell execution
+
+`!command` and the `run_command` / `run_build` / `run_tests` proposal ops
+share the file-mutation approval queue above: Build proposes, Plan holds,
+`/approve` executes, `/deny` drops, `/undo` honestly refuses (shell
+effects cannot be reversed). Execution itself is direct process spawn —
+never a shell — with the program plus literal arguments in the workspace
+directory, so pipes, redirects, globs, and expansions do not exist.
+Security boundaries, stated plainly:
+
+- Exact resolved program shown before approval; bare names search `PATH`
+  (never the current directory), absolute paths must exist, no allowlist
+  to maintain — approval visibility is the control.
+- 60 s timeout and 1 MiB per-stream output caps (drained, never deadlock);
+  stdin is always null; cooperative cancellation kills promptly.
+- The child environment is the parent's *minus* secret variables (exact
+  names, currently `AUREL_API_KEY`, ASCII case-insensitive): ordinary
+  variables pass through so builds behave, credentials never do. Output
+  redaction stays a second, independent defense.
+- Success, nonzero exit, timeout, cancellation, and launch failure are
+  distinct typed states, never one generic error.
+
+Project builds/tests resolve `Cargo.toml`, then `package.json`, `go.mod`,
+`Makefile`. No Git mutations (Phase 8).
 
 ## Interaction layer
 
@@ -161,8 +186,8 @@ streams throughout); piped input keeps the Phase 0 help behavior. One
 - `/new` clears history, pending proposals, and undo state (mode
   preserved). `/settings` toggles `auto_compaction` session-scoped — no
   file writes except through the approval workflow below.
-- `!command` queues an explicit shell request for approval (direct
-  execution, no shell); nothing executes.
+- `!command` queues an explicit shell request into the same approval
+  flow as file mutations (direct execution, no shell).
 
 ## Configuration
 
@@ -313,8 +338,8 @@ Same host and caveats as above. Direct-spawn execution plus approval
 wiring for shell commands — `std::process`/`std::thread` only, no new
 crates.io graph entries, no async.
 
-- Release binary: 3,232,768 bytes (≈3.08 MiB), i.e. +147,456 bytes
-  (+4.8%) vs Phase 6, mostly new code paths rather than dependencies.
+- Release binary: 3,243,008 bytes (≈3.09 MiB), i.e. +157,696 bytes
+  (+5.1%) vs Phase 6, mostly new code paths rather than dependencies.
   Still far under the < 15 MB Core target.
 - Startup, warm process start-to-exit: release `--version` ≈16–26 ms —
   unchanged; command state builds per approval and costs nothing

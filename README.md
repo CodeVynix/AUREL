@@ -224,7 +224,10 @@ exist (a `!` line needing them is rejected at parse or resolve time).
 Every run is bounded (60 s timeout, 1 MiB per output stream), reports
 success / nonzero exit / timeout / cancellation / launch failure
 separately, and scrubs the configured API key from captured output.
-Plan mode holds shell proposals without applying, like file mutations.
+Child processes inherit the environment minus secret variables
+(`AUREL_API_KEY` never passes through); ordinary variables are preserved
+so builds behave. Plan mode holds shell proposals without applying, like
+file mutations.
 Shell effects cannot be undone — `/undo` says so explicitly instead of
 pretending. Project builds and tests run through the same system:
 `run_build` / `run_tests` proposals resolve `Cargo.toml`, `package.json`,

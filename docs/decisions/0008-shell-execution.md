@@ -34,14 +34,21 @@ observed every 10 ms, output is capped per stream with drain-discard (no
 deadlock, bounded memory). The configured API key is scrubbed from
 captured output before display or storage.
 
+Environment policy: the child inherits the parent environment *minus* an
+exact-name denylist of secret-bearers (currently `AUREL_API_KEY`, matched
+ASCII case-insensitively). Ordinary variables pass through untouched so
+builds behave predictably; credentials never reach the child. Output
+redaction stays a second, independent defense — neither layer assumes the
+other.
+
 ## Resource impact
 
 Measured deltas recorded before the Phase 7 commit (Windows 11 /
 AMD Athlon 300U / Rust 1.98.1, release), vs Phase 6 (3,085,312 bytes /
 ≈18–26 ms startup):
 
-- release binary size: 3,232,768 bytes (≈3.08 MiB), i.e. +147,456 bytes
-  (+4.8%) — new code paths, no new dependency weight.
+- release binary size: 3,243,008 bytes (≈3.09 MiB), i.e. +157,696 bytes
+  (+5.1%) — new code paths, no new dependency weight.
 - release `--version` startup: warm ≈16–26 ms — unchanged.
 - new crates.io graph entries: none (`std::process`/`std::thread` only).
   Two short-lived reader threads exist per running command and join
