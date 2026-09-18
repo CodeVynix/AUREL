@@ -626,7 +626,40 @@ fn execute_agent(
     };
     let mut session = AgentSession::new();
     load_session_instructions(&mut session, &rt.cwd, err);
-    run_agent(&agent, &mut session, message, out, err)
+    let (code, outcome) = run_agent(&agent, &mut session, message, out, err);
+    // One-shot runs cannot approve anything: surface completed-turn
+    // proposals as a reviewable diff and exit nonzero so scripts do not
+    // mistake the situation for a clean completion.
+    if matches!(outcome, AgentOutcome::Completed(_)) {
+        let context = match aurel_tools::ToolContext::new(&rt.cwd) {
+            Ok(context) => context,
+            Err(error) => {
+                let _ = writeln!(err, "warning: cannot prepare proposals: {error}");
+                return code;
+            }
+        };
+        let mut next_id = 1u64;
+        let mut shown = 0usize;
+        for proposal in interactive::review_proposals(
+            &context,
+            &mut next_id,
+            &outcome.result().content,
+            out,
+            err,
+        ) {
+            shown += 1;
+            let _ = writeln!(out, "Proposal #{}: {}", proposal.id, proposal.op.summary());
+            let _ = write!(out, "{}", proposal.diff);
+        }
+        if shown > 0 {
+            let _ = writeln!(
+                out,
+                "Re-run interactively to review (/diff), then /approve or /deny."
+            );
+            return EXIT_RUNTIME_ERROR;
+        }
+    }
+    code
 }
 
 /// Load the nearest `AGENTS.md` above `cwd` into the session as project
@@ -660,7 +693,7 @@ fn run_agent<P: ModelProvider>(
     message: &str,
     out: &mut dyn Write,
     err: &mut dyn Write,
-) -> i32 {
+) -> (i32, AgentOutcome) {
     let streaming = agent.config().streaming;
     let cancel = CancelFlag::new();
     let mut sink = StreamSink::new(out);
@@ -669,7 +702,8 @@ fn run_agent<P: ModelProvider>(
     });
     let failed = sink.failed;
     let out = sink.out;
-    print_agent_outcome(&outcome, streaming, failed, out, err)
+    let code = print_agent_outcome(&outcome, streaming, failed, out, err);
+    (code, outcome)
 }
 
 /// Print an [`AgentOutcome`] produced by [`run_agent`] or the interactive
@@ -1214,7 +1248,7 @@ mod tests {
         };
         let mut err = Vec::new();
         let mut session = AgentSession::new();
-        let code = run_agent(&agent, &mut session, "hi", &mut out, &mut err);
+        let (code, _) = run_agent(&agent, &mut session, "hi", &mut out, &mut err);
         assert_eq!(code, EXIT_RUNTIME_ERROR);
         assert!(
             agent.provider().offered.get() < 10,

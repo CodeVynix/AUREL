@@ -11,7 +11,7 @@ members = [
 # Single definition of shared package metadata. Member crates inherit via
 # `*.workspace = true` so versions cannot silently drift.
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.98.1"
 license = "MIT OR Apache-2.0"

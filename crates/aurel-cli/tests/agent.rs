@@ -292,3 +292,78 @@ fn version_with_agent_is_exit_2() {
     .expect("spawn aurel");
     assert_eq!(output.status.code(), Some(2));
 }
+
+/// A stub serving exactly one chat-completions reply, then stopping.
+/// Minimal HTTP/1.1: reads headers plus body, answers fixed JSON.
+fn serve_once(body: String) -> (u16, std::thread::JoinHandle<()>) {
+    use std::io::{BufRead, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("header line");
+            let line = line.trim_end();
+            if line.is_empty() {
+                break;
+            }
+            // Header names are case-insensitive; ureq sends them lowercase.
+            if let Some(value) = line
+                .split_once(':')
+                .filter(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+                .map(|(_, value)| value)
+            {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
+        }
+        let mut discard = vec![0u8; content_length];
+        std::io::Read::read_exact(&mut reader, &mut discard).expect("request body");
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).expect("head");
+        stream.write_all(body.as_bytes()).expect("body");
+        stream.flush().expect("flush");
+    });
+    (port, handle)
+}
+
+#[test]
+fn agent_oneshot_shows_proposals_without_applying() {
+    let root = test_root("oneshot-proposal");
+    let home = root.join("home");
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).expect("work");
+    let reply = "{\"choices\": [{\"message\": {\"role\": \"assistant\", \"content\": \"Here:\\n```aurel-mutation\\n{\\\"op\\\": \\\"create_file\\\", \\\"path\\\": \\\"made.txt\\\", \\\"content\\\": \\\"hello\\\\n\\\"}\\n```\\n\"}, \"finish_reason\": \"stop\"}]}";
+    let (port, server) = serve_once(reply.to_string());
+
+    let output = isolated(
+        aurel()
+            .current_dir(&work)
+            .arg("--base-url")
+            .arg(format!("http://127.0.0.1:{port}/v1"))
+            .arg("--streaming=false")
+            .arg("agent")
+            .arg("do it"),
+        &home,
+    )
+    .output()
+    .expect("spawn aurel");
+    // Displayed for review, never applied, nonzero so scripts notice.
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout: {}",
+        stdout_text(&output)
+    );
+    let stdout = stdout_text(&output);
+    assert!(stdout.contains("Proposal #1"), "got stdout: {stdout:?}");
+    assert!(stdout.contains("+hello"), "got: {stdout:?}");
+    assert!(stdout.contains("Re-run interactively"), "got: {stdout:?}");
+    assert!(!work.join("made.txt").exists(), "one-shot must never apply");
+    server.join().expect("server finishes");
+}

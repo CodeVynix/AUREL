@@ -70,13 +70,13 @@ plan> hello
 Actual `--version` output:
 
 ```text
-aurel 0.6.0
+aurel 0.7.0
 ```
 
 Actual `--help` output:
 
 ```text
-aurel 0.6.0
+aurel 0.7.0
 Autonomous Utility & Reasoning Engine for Logic
 
 USAGE:
@@ -114,7 +114,7 @@ Behavior:
 | ---------- | --------- | ------ |
 | `aurel` | 0 | help to stdout (config files untouched) |
 | `aurel --help` / `-h` | 0 | help to stdout |
-| `aurel --version` / `-V` | 0 | `aurel 0.6.0` to stdout |
+| `aurel --version` / `-V` | 0 | `aurel 0.7.0` to stdout |
 | `aurel config show` | 0 | effective config as TOML to stdout (key redacted) |
 | `aurel config` / `aurel config --help` | 0 | command help to stdout |
 | `aurel chat "hi"` | 0 | model reply to stdout |
@@ -174,6 +174,9 @@ one-shot (`aurel agent "hi"`, `aurel chat "hi"`, `aurel config show`).
 | `/model` | Honestly reports its backend is unimplemented |
 | `/tools` | List registered tools (all read-only in this phase) |
 | `/init [--force]` | Create `AGENTS.md` starter (never overwrites silently) |
+| `/approve [#id]`, `/deny [#id]` | Apply / drop the pending file mutation (Build only) |
+| `/diff` | Re-show the pending proposal diff |
+| `/undo` | Reverse the last AUREL-applied change |
 | `@general`, `@explore` | Prompt scope (`@explore` notes cross-session is future) |
 | `!command` | Parsed only — shell execution is not implemented yet |
 | blank line | Prints the input hint, then reprompts |
@@ -197,6 +200,18 @@ escapes, and symlink breakouts are rejected; everything is bounded):
 
 List them at runtime with `/tools`. They read only: no writes, no shell,
 no Git mutations, no hidden access.
+
+## File mutations + approval (Build mode)
+
+In Build mode the agent may propose file mutations as fenced
+`aurel-mutation` blocks (`create_file`, `edit_file`, `overwrite_file`,
+`move`, `delete_file`). Proposals are parsed, sandboxed, snapshotted, and
+shown as diffs — never auto-applied. Review with `/diff`, apply with
+`/approve`, drop with `/deny`, revert with `/undo` (session-scoped, only
+AUREL-applied changes). Plan mode holds proposals without applying;
+approval re-verifies prior bytes, so external edits fail as stale instead
+of applying. One-shot `aurel agent` prints proposals and exits 1 since it
+cannot approve.
 
 ## Project instructions (`AGENTS.md`)
 

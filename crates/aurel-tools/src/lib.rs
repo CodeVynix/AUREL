@@ -1,19 +1,22 @@
-//! `aurel-tools`: read-only core inspection tools for AUREL.
+//! `aurel-tools`: read-only core inspection tools plus opt-in file
+//! mutations for AUREL.
 //!
-//! Everything here inspects; nothing mutates. The shared entry point is
-//! [`ToolContext`], bound to one workspace root: every path a tool touches
-//! is resolved through [`ToolContext::resolve`], which canonicalizes (so
-//! symlinks cannot escape) and rejects anything outside the root.
+//! Inspection ([`ToolContext`]) only ever reads, behind one workspace
+//! sandbox. Mutations ([`MutationOp`] and friends) never execute on their
+//! own: they are proposed, snapshotted, diffed, and only applied after
+//! explicit user approval, with session-scoped undo.
 //!
 //! [`ProjectInstructions`] covers `AGENTS.md`: starter template, guarded
 //! creation, upward discovery, and bounded loading.
 //!
-//! Standard library only, by design: inspection must stay cheap enough
-//! that linking it changes Core's footprint negligibly.
+//! Near-zero dependencies by design: only `serde`/`serde_json` for parsing
+//! model-proposed mutation blocks (both already in the workspace graph).
+//! Inspection itself stays standard-library only.
 
 mod context;
 mod error;
 mod instructions;
+mod mutation;
 
 pub use context::{
     tool_catalog, DirEntry, DirListing, EntryKind, FileStat, Limits, Match, Permission,
@@ -23,4 +26,8 @@ pub use error::ToolError;
 pub use instructions::{
     discover_agents_md, init_agents_md, load_agents_md, load_instructions_for_dir,
     starter_template, InitOutcome, ProjectInstructions, AGENTS_MD, MAX_INSTRUCTIONS_BYTES,
+};
+pub use mutation::{
+    parse_proposals, prepare_proposal, render_diff, verify_fresh, AppliedChange, MutationOp,
+    PendingProposal, ProposalError, ResolvedOp, FENCE_TAG, MAX_DIFF_LINES, MAX_PROPOSALS_PER_RUN,
 };

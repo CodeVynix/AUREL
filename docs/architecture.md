@@ -1,6 +1,6 @@
-# AUREL Architecture — Phase 5
+# AUREL Architecture — Phase 6
 
-This document describes what Phase 5 actually contains. Nothing more.
+This document describes what Phase 6 actually contains. Nothing more.
 
 ## Workspace
 
@@ -119,6 +119,23 @@ absent files run bare, unreadable ones warn and continue. Oversized files
 truncate at 64 KiB with a marker. The file itself stays user-owned:
 AUREL never edits it.
 
+## File mutations + approval
+
+In Build mode the agent may propose file mutations as fenced
+`aurel-mutation` JSON blocks (`create_file`, `edit_file` with an exact
+single-anchor match, `overwrite_file`, `move`, `delete_file`). Each block
+is parsed strictly (unknown ops/fields fail loudly), resolved through the
+same workspace sandbox, snapshotted, and rendered as a bounded diff — then
+queued, never executed. `/diff` re-shows the front proposal; `/approve`
+re-checks Build mode, the requested id, and byte-identical prior state
+before one atomic apply (temp file + backup swap), recording the inverse
+for session-scoped `/undo`; `/deny` drops without executing. External
+edits between proposal and approval fail as stale. Plan mode queues for
+review but its approvals are always rejected. One-shot `aurel agent`
+prints proposals and exits 1 since it cannot approve. Writes are bounded
+(256 KiB), parents must exist, destinations must be absent-or-expected,
+and errors name paths only — never contents. No shell, no Git.
+
 ## Interaction layer
 
 Bare `aurel` on a terminal enters a minimal line REPL
@@ -132,17 +149,18 @@ streams throughout); piped input keeps the Phase 0 help behavior. One
   future tools must consult — Plan performs no mutations.
 - Slash commands are parsed and dispatched locally, never sent to the
   model: help/version/plan/build/status/compact/btw/new/history/context/
-  settings/config/tools/exit/quit. Backends owned by later phases
-  (`/model`, shell execution, cross-session retrieval) say so instead of
-  pretending.
+  settings/config/tools/init/approve/deny/diff/undo/exit/quit. Backends
+  owned by later phases (`/model`, shell execution, cross-session
+  retrieval) say so instead of pretending.
 - `@general` (default) and `@explore` annotate one prompt's scope;
   `@explore` answers from the current session with an explicit notice.
 - `/btw` runs a side question on a private session clone and discards it:
   history, mode, and counters are byte-identical afterwards.
 - `/compact` (manual) and auto-compaction (on by default, threshold 20,
   keeps 4) summarize through the model layer into one `system` message.
-- `/new` clears history (mode preserved). `/settings` toggles
-  `auto_compaction` session-scoped — no file writes in Phase 4.
+- `/new` clears history, pending proposals, and undo state (mode
+  preserved). `/settings` toggles `auto_compaction` session-scoped — no
+  file writes except through the approval workflow below.
 - `!command` parses as an explicit shell request and is refused with a
   clear message; nothing executes.
 
@@ -187,8 +205,9 @@ requirement plus an ADR.
 
 - Third-party dependencies: `serde` + parse-only `toml` (config), plus the
   HTTP/TLS/JSON stack (`ureq`, `rustls` + crypto, `serde_json`) confined to
-  `aurel-model` (`cargo tree` shows `aurel-core` and `aurel-tools` still
-  dependency-free; the parser in `aurel-cli` is dependency-free).
+  `aurel-model`; `aurel-tools` adds only `serde`/`serde_json` edges for
+  mutation-block parsing, no new crates (`cargo tree` shows `aurel-core`
+  still dependency-free; the parser in `aurel-cli` is dependency-free).
 - No background threads/workers (test stub servers excepted), no config
   file I/O except the files being loaded, no model-server code inside
   AUREL (server memory is the server's, never attributed here).
@@ -274,3 +293,16 @@ wiring — no new crates.io graph entries at all.
   (+0.4%) vs Phase 4. Still far under the < 15 MB Core target.
 - Startup, warm process start-to-exit: release `--version` ≈26–31 ms —
   unchanged; tools and instructions load lazily per invocation.
+
+## Phase 6 delta (measured, informational)
+
+Same host and caveats as above. Mutation machinery inside `aurel-tools`
+plus approval wiring in the CLI — two crates.io edges (`serde`,
+`serde_json`, both already in the graph), no new crates, no async.
+
+- Release binary: 3,085,312 bytes (≈2.94 MiB), i.e. +152,064 bytes
+  (+5.2%) vs Phase 5, mostly new code paths rather than dependencies.
+  Still far under the < 15 MB Core target.
+- Startup, warm process start-to-exit: release `--version` ≈18–26 ms —
+  unchanged; approval state builds per session and costs nothing
+  at startup.

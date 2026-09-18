@@ -69,6 +69,9 @@ pub fn tool_catalog() -> Vec<ToolInfo> {
 pub struct Limits {
     /// Max bytes read from one file by `read_file`.
     pub max_read_bytes: u64,
+    /// Max bytes written by one mutation (`create`/`edit`/`overwrite`
+    /// payloads, prior snapshots, deleted-file restore).
+    pub max_write_bytes: u64,
     /// Max entries returned by one `list_dir` call.
     pub max_list_entries: usize,
     /// Max recursion depth for `list_dir`/`search` (1 = immediate children).
@@ -85,6 +88,7 @@ impl Default for Limits {
     fn default() -> Self {
         Limits {
             max_read_bytes: 256 * 1024,
+            max_write_bytes: 256 * 1024,
             max_list_entries: 500,
             max_depth: 8,
             max_search_matches: 100,

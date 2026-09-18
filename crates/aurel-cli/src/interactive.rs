@@ -7,12 +7,13 @@
 //! work. No TUI framework: plain line I/O over injected streams, so every
 //! path is unit-testable.
 
+use std::collections::VecDeque;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
 use aurel_config::EffectiveConfig;
 use aurel_model::{Agent, AgentConfig, AgentSession, CancelFlag, Mode, ModelProvider};
-use aurel_tools::{InitOutcome, AGENTS_MD};
+use aurel_tools::{AppliedChange, InitOutcome, PendingProposal, AGENTS_MD};
 
 use super::{
     build_provider, build_request, print_agent_outcome, Runtime, StreamSink, EXIT_RUNTIME_ERROR,
@@ -76,6 +77,18 @@ pub enum SlashCommand {
         /// Explicit replacement of an existing `AGENTS.md`.
         force: bool,
     },
+    /// Apply the pending proposal (`/approve [#id]`).
+    Approve {
+        id: Option<u64>,
+    },
+    /// Drop the pending proposal (`/deny [#id]`).
+    Deny {
+        id: Option<u64>,
+    },
+    /// Re-show the pending proposal diff.
+    Diff,
+    /// Reverse the last AUREL-applied change.
+    Undo,
     Exit,
     Unknown(String),
 }
@@ -167,6 +180,22 @@ fn parse_slash(rest: &str) -> SlashCommand {
             "--force" => SlashCommand::Init { force: true },
             _ => SlashCommand::Unknown(format!("init {args}")),
         },
+        "approve" => match args {
+            "" => SlashCommand::Approve { id: None },
+            digits => match digits.parse::<u64>() {
+                Ok(id) => SlashCommand::Approve { id: Some(id) },
+                Err(_) => SlashCommand::Unknown(format!("approve {args}")),
+            },
+        },
+        "deny" => match args {
+            "" => SlashCommand::Deny { id: None },
+            digits => match digits.parse::<u64>() {
+                Ok(id) => SlashCommand::Deny { id: Some(id) },
+                Err(_) => SlashCommand::Unknown(format!("deny {args}")),
+            },
+        },
+        "diff" => SlashCommand::Diff,
+        "undo" => SlashCommand::Undo,
         "exit" | "quit" => SlashCommand::Exit,
         _ => SlashCommand::Unknown(name.to_string()),
     }
@@ -197,10 +226,18 @@ pub struct Repl<P> {
     session: AgentSession,
     config: EffectiveConfig,
     /// Project root for `AGENTS.md` creation and instructions discovery
-    /// (the working directory the loop started in).
+    /// (the working directory the loop started in). Mutation paths resolve
+    /// against this same root through a fresh [`ToolContext`] per command.
     workdir: PathBuf,
     iterations_used: u32,
     compactions: u32,
+    /// Queued mutation proposals awaiting explicit approval, front first.
+    /// Nothing here has executed; `/approve` acts on the front only.
+    pending: VecDeque<PendingProposal>,
+    next_proposal_id: u64,
+    /// Inverses of AUREL-applied changes, newest last. Only these records
+    /// can ever be undone — nothing the user did outside AUREL is here.
+    undo_stack: Vec<AppliedChange>,
 }
 
 impl<P: ModelProvider> Repl<P> {
@@ -223,6 +260,9 @@ impl<P: ModelProvider> Repl<P> {
             workdir,
             iterations_used: 0,
             compactions: 0,
+            pending: VecDeque::new(),
+            next_proposal_id: 1,
+            undo_stack: Vec::new(),
         })
     }
 
@@ -318,6 +358,8 @@ impl<P: ModelProvider> Repl<P> {
                 self.session.clear();
                 self.iterations_used = 0;
                 self.compactions = 0;
+                self.pending.clear();
+                self.undo_stack.clear();
                 let _ = writeln!(
                     out,
                     "New session started (mode preserved: {}).",
@@ -354,6 +396,22 @@ impl<P: ModelProvider> Repl<P> {
             }
             SlashCommand::Init { force } => {
                 self.run_init(*force, out, err);
+                true
+            }
+            SlashCommand::Approve { id } => {
+                self.run_approve(*id, out, err);
+                true
+            }
+            SlashCommand::Deny { id } => {
+                self.run_deny(*id, out, err);
+                true
+            }
+            SlashCommand::Diff => {
+                self.run_diff(out);
+                true
+            }
+            SlashCommand::Undo => {
+                self.run_undo(out, err);
                 true
             }
             SlashCommand::Exit => false,
@@ -414,6 +472,11 @@ impl<P: ModelProvider> Repl<P> {
         let failed = sink.failed;
         let out = sink.out;
         let _ = print_agent_outcome(&outcome, self.agent.config().streaming, failed, out, err);
+        // Completed turns may carry model-proposed file mutations; collect
+        // them for explicit review (never auto-applied).
+        if matches!(outcome, aurel_model::AgentOutcome::Completed(_)) {
+            self.collect_proposals(&outcome.result().content, out, err);
+        }
     }
 
     /// Answer a side question on a private clone of the session: the main
@@ -457,6 +520,157 @@ impl<P: ModelProvider> Repl<P> {
             }
             Err(error) => {
                 let _ = writeln!(err, "{error}");
+            }
+        }
+    }
+
+    /// Workspace sandbox for mutation commands, rebuilt per call so a
+    /// moved or deleted working directory fails cleanly instead of acting
+    /// on a stale handle.
+    fn tools(&self) -> Result<aurel_tools::ToolContext, aurel_tools::ToolError> {
+        aurel_tools::ToolContext::new(&self.workdir)
+    }
+
+    /// Collect model-proposed mutations from a completed turn into the
+    /// pending queue. Works identically in both modes — the Plan/Build
+    /// gate lives at approval time, so proposals survive a mode switch
+    /// (freshness is re-verified then). Nothing here executes.
+    fn collect_proposals(&mut self, content: &str, out: &mut dyn Write, err: &mut dyn Write) {
+        let context = match self.tools() {
+            Ok(context) => context,
+            Err(error) => {
+                let _ = writeln!(err, "warning: cannot prepare proposals: {error}");
+                return;
+            }
+        };
+        for proposal in review_proposals(&context, &mut self.next_proposal_id, content, out, err) {
+            let _ = writeln!(out, "Proposal #{}: {}", proposal.id, proposal.op.summary());
+            let _ = write!(out, "{}", proposal.diff);
+            self.pending.push_back(proposal);
+        }
+        if !self.pending.is_empty() {
+            let _ = writeln!(out, "Review with /diff, then /approve [#id] or /deny.");
+            if self.session.mode() != Mode::Build {
+                let _ = writeln!(
+                    out,
+                    "Note: Plan mode holds proposals without applying — switch to Build to approve."
+                );
+            }
+        }
+    }
+
+    /// Approve the front pending proposal after re-verifying it: session
+    /// mode must still be Build, the id (if given) must match, and prior
+    /// filesystem state must read back byte-identical. Success records the
+    /// inverse for session-scoped undo.
+    fn run_approve(&mut self, id: Option<u64>, out: &mut dyn Write, err: &mut dyn Write) {
+        let front = match self.pending.front() {
+            Some(proposal) => proposal,
+            None => {
+                let _ = writeln!(err, "error: nothing pending — no mutation to approve");
+                return;
+            }
+        };
+        if id.is_some_and(|wanted| wanted != front.id) {
+            let _ = writeln!(
+                err,
+                "error: stale approval (proposal #{} is pending, not #{})",
+                front.id,
+                id.expect("checked above")
+            );
+            return;
+        }
+        if self.session.mode() != Mode::Build {
+            let _ = writeln!(
+                err,
+                "error: mode is Plan — switch to Build with /build or Tab to approve mutations"
+            );
+            return;
+        }
+        let context = match self.tools() {
+            Ok(context) => context,
+            Err(error) => {
+                let _ = writeln!(err, "error: cannot apply proposal: {error}");
+                return;
+            }
+        };
+        if let Err(error) = aurel_tools::verify_fresh(&context, front) {
+            self.pending.pop_front();
+            let _ = writeln!(err, "{error} (proposal dropped)");
+            return;
+        }
+        let proposal = self.pending.pop_front().expect("front checked above");
+        match context.apply_mutation(&proposal.op, None) {
+            Ok(change) => {
+                self.undo_stack.push(change);
+                let _ = writeln!(out, "Applied proposal #{}.", proposal.id);
+            }
+            Err(error) => {
+                let _ = writeln!(err, "error: mutation failed: {error}");
+            }
+        }
+    }
+
+    /// Drop the front pending proposal without executing anything.
+    fn run_deny(&mut self, id: Option<u64>, out: &mut dyn Write, err: &mut dyn Write) {
+        let front = match self.pending.front() {
+            Some(proposal) => proposal,
+            None => {
+                let _ = writeln!(err, "error: nothing pending — nothing to deny");
+                return;
+            }
+        };
+        if id.is_some_and(|wanted| wanted != front.id) {
+            let _ = writeln!(
+                err,
+                "error: stale denial (proposal #{} is pending, not #{})",
+                front.id,
+                id.expect("checked above")
+            );
+            return;
+        }
+        let dropped = self.pending.pop_front().expect("front checked above");
+        let _ = writeln!(out, "Denied proposal #{} (nothing executed).", dropped.id);
+    }
+
+    /// Re-show the front pending proposal diff.
+    fn run_diff(&self, out: &mut dyn Write) {
+        match self.pending.front() {
+            Some(proposal) => {
+                let _ = writeln!(out, "Proposal #{}: {}", proposal.id, proposal.op.summary());
+                let _ = write!(out, "{}", proposal.diff);
+                let _ = writeln!(out, "(use /approve [#{}] or /deny)", proposal.id);
+            }
+            None => {
+                let _ = writeln!(out, "No pending proposals.");
+            }
+        }
+    }
+
+    /// Reverse the last AUREL-applied change. Only inverses recorded in the
+    /// session undo stack can run here, so undo never touches anything
+    /// AUREL did not itself change.
+    fn run_undo(&mut self, out: &mut dyn Write, err: &mut dyn Write) {
+        let change = match self.undo_stack.pop() {
+            Some(change) => change,
+            None => {
+                let _ = writeln!(err, "error: nothing to undo");
+                return;
+            }
+        };
+        let context = match self.tools() {
+            Ok(context) => context,
+            Err(error) => {
+                let _ = writeln!(err, "error: cannot undo: {error}");
+                return;
+            }
+        };
+        match context.undo_change(&change) {
+            Ok(()) => {
+                let _ = writeln!(out, "Undone.");
+            }
+            Err(error) => {
+                let _ = writeln!(err, "error: undo failed: {error}");
             }
         }
     }
@@ -538,6 +752,8 @@ impl<P: ModelProvider> Repl<P> {
         let _ = writeln!(out, "session messages: {}", self.session.history().len());
         let _ = writeln!(out, "iterations used: {}", self.iterations_used);
         let _ = writeln!(out, "compactions: {}", self.compactions);
+        let _ = writeln!(out, "pending proposals: {}", self.pending.len());
+        let _ = writeln!(out, "undo depth: {}", self.undo_stack.len());
     }
 
     fn print_history(&self, out: &mut dyn Write) {
@@ -641,6 +857,41 @@ fn mutation_word(mode: Mode) -> &'static str {
     }
 }
 
+/// Parse fenced mutation blocks out of model output, prepare each against
+/// the workspace (resolve, snapshot, diff), print problems and diffs, and
+/// return the queueable proposals with fresh ids. Pure coordination over
+/// [`aurel_tools`] primitives — shared by the interactive loop and the
+/// one-shot agent path so both review identically.
+pub(crate) fn review_proposals(
+    context: &aurel_tools::ToolContext,
+    next_id: &mut u64,
+    content: &str,
+    _out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Vec<PendingProposal> {
+    use aurel_tools::{parse_proposals, prepare_proposal, MAX_PROPOSALS_PER_RUN};
+    let (operations, mut notes) = parse_proposals(content);
+    if operations.len() > MAX_PROPOSALS_PER_RUN {
+        notes.push(format!(
+            "proposal cap reached ({} per reply); extras ignored",
+            MAX_PROPOSALS_PER_RUN
+        ));
+    }
+    let mut prepared = Vec::new();
+    for op in operations.into_iter().take(MAX_PROPOSALS_PER_RUN) {
+        let id = *next_id;
+        *next_id += 1;
+        match prepare_proposal(context, id, op) {
+            Ok(proposal) => prepared.push(proposal),
+            Err(error) => notes.push(format!("dropped proposal (#{id}): {error}")),
+        }
+    }
+    for note in notes {
+        let _ = writeln!(err, "note: {note}");
+    }
+    prepared
+}
+
 fn on_off(value: bool) -> &'static str {
     if value {
         "on"
@@ -678,6 +929,10 @@ Commands (local — never sent to the model):
   /config               Show effective configuration (key redacted)
   /tools                List registered tools (all read-only in this phase)
   /init [--force]       Create AGENTS.md starter (never overwrites silently)
+  /approve [#id]        Apply the pending proposal (Build mode only)
+  /deny [#id]           Drop the pending proposal without executing
+  /diff                 Re-show the pending proposal diff
+  /undo                 Reverse the last AUREL-applied change
   /exit | /quit         Leave the loop
 @general / @explore prefix one prompt with a context scope.
 !command names an explicit shell request (not run yet).
@@ -1192,6 +1447,311 @@ mod tests {
             .history()
             .iter()
             .all(|message| message.content != "Prefer tabs.\n"));
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    fn p6_workdir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("aurel-p6-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test workdir");
+        dir
+    }
+
+    fn fence(op_json: &str) -> String {
+        format!("Sure, here it is:\n```aurel-mutation\n{op_json}\n```\nDone.\n")
+    }
+
+    fn prompt(text: String) -> InputKind {
+        InputKind::Prompt {
+            scope: ContextScope::General,
+            text,
+        }
+    }
+
+    #[test]
+    fn parses_approval_forms() {
+        assert_eq!(
+            parse_input_line("/approve"),
+            InputKind::Slash(SlashCommand::Approve { id: None })
+        );
+        assert_eq!(
+            parse_input_line("/approve 3"),
+            InputKind::Slash(SlashCommand::Approve { id: Some(3) })
+        );
+        assert!(matches!(
+            parse_input_line("/approve x"),
+            InputKind::Slash(SlashCommand::Unknown(_))
+        ));
+        assert_eq!(
+            parse_input_line("/deny 2"),
+            InputKind::Slash(SlashCommand::Deny { id: Some(2) })
+        );
+        assert_eq!(
+            parse_input_line("/diff"),
+            InputKind::Slash(SlashCommand::Diff)
+        );
+        assert_eq!(
+            parse_input_line("/undo"),
+            InputKind::Slash(SlashCommand::Undo)
+        );
+    }
+
+    #[test]
+    fn plan_holds_proposals_and_blocks_approval() {
+        let workdir = p6_workdir("plan-hold");
+        let reply = fence(r#"{"op": "create_file", "path": "p.txt", "content": "hi"}"#);
+        let mut repl = test_repl_in(vec![ScriptedProvider::reply(&reply)], workdir.clone());
+        repl.session.set_mode(Mode::Plan);
+
+        let (cont, out, _) = dispatch_to_string(&mut repl, &prompt("do it".into()));
+        assert!(cont);
+        assert!(out.contains("Proposal #1"), "got: {out:?}");
+        assert!(out.contains("Plan mode"), "got: {out:?}");
+        assert_eq!(repl.pending.len(), 1);
+        // Nothing executed in Plan mode.
+        assert!(!workdir.join("p.txt").exists());
+
+        // Approval stays rejected until the mode flips back.
+        let (cont, _, err) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Approve { id: None }),
+        );
+        assert!(cont);
+        assert!(err.contains("Plan"), "got: {err:?}");
+        assert_eq!(repl.pending.len(), 1);
+        assert!(!workdir.join("p.txt").exists());
+
+        let (cont, _, _) = dispatch_to_string(&mut repl, &InputKind::Slash(SlashCommand::Build));
+        assert!(cont);
+        let (cont, out, _) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Approve { id: None }),
+        );
+        assert!(cont);
+        assert!(out.contains("Applied proposal #1"), "got: {out:?}");
+        assert_eq!(
+            std::fs::read_to_string(workdir.join("p.txt")).expect("created"),
+            "hi"
+        );
+        assert!(repl.pending.is_empty());
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn approve_after_flip_to_plan_is_rejected() {
+        // Propose in Build, flip to Plan, approve: rejected, queue intact.
+        let workdir = p6_workdir("flip-to-plan");
+        let reply = fence(r#"{"op": "create_file", "path": "f.txt", "content": "x"}"#);
+        let mut repl = test_repl_in(vec![ScriptedProvider::reply(&reply)], workdir.clone());
+        dispatch_to_string(&mut repl, &prompt("do it".into()));
+        assert_eq!(repl.pending.len(), 1);
+        dispatch_to_string(&mut repl, &InputKind::Slash(SlashCommand::Plan));
+        let (cont, _, err) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Approve { id: None }),
+        );
+        assert!(cont);
+        assert!(err.contains("Plan"), "got: {err:?}");
+        assert_eq!(repl.pending.len(), 1);
+        assert!(!workdir.join("f.txt").exists());
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn build_collects_without_executing() {
+        let workdir = p6_workdir("collect");
+        let reply = fence(r#"{"op": "create_file", "path": "q.txt", "content": "hello"}"#);
+        let mut repl = test_repl_in(vec![ScriptedProvider::reply(&reply)], workdir.clone());
+
+        let (cont, out, _) = dispatch_to_string(&mut repl, &prompt("do it".into()));
+        assert!(cont);
+        assert!(out.contains("Proposal #1: create_file"), "got: {out:?}");
+        assert!(out.contains("+hello"), "got: {out:?}");
+        assert!(out.contains("/approve"), "got: {out:?}");
+        assert_eq!(repl.pending.len(), 1);
+        // Collection never executes: approval is the only path.
+        assert!(!workdir.join("q.txt").exists());
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn approve_diff_deny_undo_flow() {
+        let workdir = p6_workdir("flow");
+        let reply = fence(r#"{"op": "create_file", "path": "f.txt", "content": "v1"}"#);
+        let mut repl = test_repl_in(vec![ScriptedProvider::reply(&reply)], workdir.clone());
+        dispatch_to_string(&mut repl, &prompt("do it".into()));
+
+        // /diff re-shows the pending proposal.
+        let (cont, out, _) = dispatch_to_string(&mut repl, &InputKind::Slash(SlashCommand::Diff));
+        assert!(cont);
+        assert!(
+            out.contains("Proposal #1") && out.contains("+v1"),
+            "got: {out:?}"
+        );
+
+        // /deny drops without executing.
+        let (cont, out, _) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Deny { id: None }),
+        );
+        assert!(cont);
+        assert!(out.contains("Denied proposal #1"), "got: {out:?}");
+        assert!(repl.pending.is_empty());
+        assert!(!workdir.join("f.txt").exists());
+
+        // Re-propose (id 2), approve by explicit id, then undo restores.
+        let reply = fence(r#"{"op": "create_file", "path": "f.txt", "content": "v2"}"#);
+        repl.agent = Agent::new(
+            ScriptedProvider {
+                script: std::cell::RefCell::new(vec![ScriptedProvider::reply(&reply)].into()),
+                calls: Cell::new(0),
+                seen: std::cell::RefCell::new(Vec::new()),
+            },
+            AgentConfig {
+                max_iterations: 5,
+                streaming: false,
+            },
+        )
+        .expect("rebuild agent");
+        dispatch_to_string(&mut repl, &prompt("again".into()));
+        assert_eq!(repl.pending.len(), 1);
+        let (cont, out, _) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Approve { id: Some(2) }),
+        );
+        assert!(cont);
+        assert!(out.contains("Applied proposal #2"), "got: {out:?}");
+        assert_eq!(
+            std::fs::read_to_string(workdir.join("f.txt")).expect("created"),
+            "v2"
+        );
+        assert_eq!(repl.undo_stack.len(), 1);
+
+        let (cont, out, _) = dispatch_to_string(&mut repl, &InputKind::Slash(SlashCommand::Undo));
+        assert!(cont);
+        assert!(out.contains("Undone"), "got: {out:?}");
+        assert!(!workdir.join("f.txt").exists());
+        assert!(repl.undo_stack.is_empty());
+
+        // Empty states report honestly instead of acting.
+        let (cont, _, err) = dispatch_to_string(&mut repl, &InputKind::Slash(SlashCommand::Undo));
+        assert!(cont);
+        assert!(err.contains("nothing to undo"), "got: {err:?}");
+        let (cont, _, err) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Approve { id: None }),
+        );
+        assert!(cont);
+        assert!(err.contains("nothing pending"), "got: {err:?}");
+        let (cont, out, _) = dispatch_to_string(&mut repl, &InputKind::Slash(SlashCommand::Diff));
+        assert!(cont);
+        assert!(out.contains("No pending proposals"), "got: {out:?}");
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn stale_ids_and_stale_files_fail_closed() {
+        let workdir = p6_workdir("stale");
+        std::fs::write(workdir.join("a.txt"), "one\n").expect("seed");
+        let reply = fence(r#"{"op": "edit_file", "path": "a.txt", "old": "one", "new": "two"}"#);
+        let mut repl = test_repl_in(vec![ScriptedProvider::reply(&reply)], workdir.clone());
+        dispatch_to_string(&mut repl, &prompt("do it".into()));
+        assert_eq!(repl.pending.len(), 1);
+
+        // Wrong id: rejected, queue untouched.
+        let (cont, _, err) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Approve { id: Some(99) }),
+        );
+        assert!(cont);
+        assert!(err.contains("stale approval"), "got: {err:?}");
+        assert_eq!(repl.pending.len(), 1);
+
+        // External edit: approve drops the proposal, file keeps its bytes.
+        std::fs::write(workdir.join("a.txt"), "one changed\n").expect("external edit");
+        let (cont, _, err) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Approve { id: None }),
+        );
+        assert!(cont);
+        assert!(err.contains("stale proposal #1"), "got: {err:?}");
+        assert!(repl.pending.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(workdir.join("a.txt")).expect("read"),
+            "one changed\n"
+        );
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn malformed_fences_become_notes() {
+        let workdir = p6_workdir("malformed");
+        let reply = "text\n```aurel-mutation\n{\"op\": \"nope\"}\n```\n```aurel-mutation\n{broken\n```\n```aurel-mutation\n{\"op\": \"delete_file\", \"path\": \"x\"}\n";
+        let mut repl = test_repl_in(vec![ScriptedProvider::reply(reply)], workdir.clone());
+        let (cont, _, err) = dispatch_to_string(&mut repl, &prompt("do it".into()));
+        assert!(cont);
+        assert!(err.contains("unknown op"), "got: {err:?}");
+        assert!(err.contains("malformed JSON"), "got: {err:?}");
+        assert!(err.contains("unclosed"), "got: {err:?}");
+        assert!(repl.pending.is_empty());
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn new_clears_approval_state() {
+        let workdir = p6_workdir("new-clears");
+        let reply = fence(r#"{"op": "create_file", "path": "n.txt", "content": "x"}"#);
+        let mut repl = test_repl_in(vec![ScriptedProvider::reply(&reply)], workdir.clone());
+        dispatch_to_string(&mut repl, &prompt("do it".into()));
+        assert_eq!(repl.pending.len(), 1);
+        let (_, _, _) = dispatch_to_string(&mut repl, &InputKind::Slash(SlashCommand::New));
+        let (cont, _, err) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Approve { id: None }),
+        );
+        assert!(cont);
+        assert!(err.contains("nothing pending"), "got: {err:?}");
+        let (cont, _, err) = dispatch_to_string(&mut repl, &InputKind::Slash(SlashCommand::Undo));
+        assert!(cont);
+        assert!(err.contains("nothing to undo"), "got: {err:?}");
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn status_and_help_show_approval_state() {
+        let workdir = p6_workdir("status-approval");
+        let reply = fence(r#"{"op": "create_file", "path": "s.txt", "content": "x"}"#);
+        let mut repl = test_repl_in(vec![ScriptedProvider::reply(&reply)], workdir.clone());
+        dispatch_to_string(&mut repl, &prompt("do it".into()));
+        let (_, out, _) = dispatch_to_string(&mut repl, &InputKind::Slash(SlashCommand::Status));
+        assert!(out.contains("pending proposals: 1"), "got: {out:?}");
+        assert!(out.contains("undo depth: 0"), "got: {out:?}");
+        let (_, out, _) = dispatch_to_string(&mut repl, &InputKind::Slash(SlashCommand::Help));
+        for command in ["/approve", "/deny", "/diff", "/undo", "/init"] {
+            assert!(out.contains(command), "help must list {command}: {out:?}");
+        }
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn review_cap_bounds_runaway_replies() {
+        use aurel_tools::ToolContext;
+        let workdir = p6_workdir("cap");
+        let context = ToolContext::new(&workdir).expect("context");
+        let mut text = String::new();
+        for i in 0..10 {
+            text.push_str(&format!(
+                "```aurel-mutation\n{{\"op\": \"create_file\", \"path\": \"f{i}.txt\", \"content\": \"x\"}}\n```\n"
+            ));
+        }
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut next_id = 1u64;
+        let queued = review_proposals(&context, &mut next_id, &text, &mut out, &mut err);
+        assert_eq!(queued.len(), 8);
+        assert_eq!(next_id, 9);
+        let err = String::from_utf8(err).expect("utf8");
+        assert!(err.contains("proposal cap reached"), "got: {err:?}");
         let _ = std::fs::remove_dir_all(&workdir);
     }
 }
