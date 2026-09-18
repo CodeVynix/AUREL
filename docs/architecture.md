@@ -1,6 +1,6 @@
-# AUREL Architecture — Phase 6
+# AUREL Architecture — Phase 7
 
-This document describes what Phase 6 actually contains. Nothing more.
+This document describes what Phase 7 actually contains. Nothing more.
 
 ## Workspace
 
@@ -161,8 +161,8 @@ streams throughout); piped input keeps the Phase 0 help behavior. One
 - `/new` clears history, pending proposals, and undo state (mode
   preserved). `/settings` toggles `auto_compaction` session-scoped — no
   file writes except through the approval workflow below.
-- `!command` parses as an explicit shell request and is refused with a
-  clear message; nothing executes.
+- `!command` queues an explicit shell request for approval (direct
+  execution, no shell); nothing executes.
 
 ## Configuration
 
@@ -305,4 +305,17 @@ plus approval wiring in the CLI — two crates.io edges (`serde`,
   Still far under the < 15 MB Core target.
 - Startup, warm process start-to-exit: release `--version` ≈18–26 ms —
   unchanged; approval state builds per session and costs nothing
+  at startup.
+
+## Phase 7 delta (measured, informational)
+
+Same host and caveats as above. Direct-spawn execution plus approval
+wiring for shell commands — `std::process`/`std::thread` only, no new
+crates.io graph entries, no async.
+
+- Release binary: 3,232,768 bytes (≈3.08 MiB), i.e. +147,456 bytes
+  (+4.8%) vs Phase 6, mostly new code paths rather than dependencies.
+  Still far under the < 15 MB Core target.
+- Startup, warm process start-to-exit: release `--version` ≈16–26 ms —
+  unchanged; command state builds per approval and costs nothing
   at startup.

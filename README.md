@@ -4,12 +4,13 @@ AUREL is a personal, terminal-first AI coding agent. This repository holds its
 Rust implementation, built as one shared foundation with a lightweight Core
 edition and (later) an extended Normal edition.
 
-> **Status: Phase 4 — Interaction layer + agent modes.** Bare `aurel` on a
-> terminal opens a minimal interactive loop with Plan/Build modes (Tab
-> toggles), local slash commands, `@general`/`@explore` scopes, `/btw`
-> side questions, `/compact`, and `/new`, on top of the bounded agent loop.
-> There are still no tools, no shell/Git automation, no memory, no GUI, and
-> no Normal edition. Nothing here operates the computer.
+> **Status: Phase 7 — Shell + build/test execution.** `!command` and the
+> `run_command` / `run_build` / `run_tests` proposal ops execute programs
+> directly (never a shell) behind the same explicit approval workflow as
+> file mutations: Build proposes, Plan blocks, `/approve` runs with
+> timeouts and bounded output, `/undo` honestly refuses shell effects.
+> There are still no Git mutations, no memory, no GUI, and no Normal
+> edition.
 
 ## Toolchain
 
@@ -70,13 +71,13 @@ plan> hello
 Actual `--version` output:
 
 ```text
-aurel 0.7.0
+aurel 0.8.0
 ```
 
 Actual `--help` output:
 
 ```text
-aurel 0.7.0
+aurel 0.8.0
 Autonomous Utility & Reasoning Engine for Logic
 
 USAGE:
@@ -114,7 +115,7 @@ Behavior:
 | ---------- | --------- | ------ |
 | `aurel` | 0 | help to stdout (config files untouched) |
 | `aurel --help` / `-h` | 0 | help to stdout |
-| `aurel --version` / `-V` | 0 | `aurel 0.7.0` to stdout |
+| `aurel --version` / `-V` | 0 | `aurel 0.8.0` to stdout |
 | `aurel config show` | 0 | effective config as TOML to stdout (key redacted) |
 | `aurel config` / `aurel config --help` | 0 | command help to stdout |
 | `aurel chat "hi"` | 0 | model reply to stdout |
@@ -178,7 +179,7 @@ one-shot (`aurel agent "hi"`, `aurel chat "hi"`, `aurel config show`).
 | `/diff` | Re-show the pending proposal diff |
 | `/undo` | Reverse the last AUREL-applied change |
 | `@general`, `@explore` | Prompt scope (`@explore` notes cross-session is future) |
-| `!command` | Parsed only — shell execution is not implemented yet |
+| `!command` | Queues a shell command for approval (direct execution, no shell) |
 | blank line | Prints the input hint, then reprompts |
 | `/exit`, `/quit`, Ctrl-D | Leave the loop |
 
@@ -212,6 +213,22 @@ AUREL-applied changes). Plan mode holds proposals without applying;
 approval re-verifies prior bytes, so external edits fail as stale instead
 of applying. One-shot `aurel agent` prints proposals and exits 1 since it
 cannot approve.
+
+## Shell + build/test execution (Build mode, approved)
+
+`!command` queues a shell command exactly like a model proposal — same
+queue, same diff review, same `/approve`. Execution is direct process
+spawn, never a shell: the program plus literal arguments runs in the
+workspace directory, so pipes, redirects, globs, and expansions do not
+exist (a `!` line needing them is rejected at parse or resolve time).
+Every run is bounded (60 s timeout, 1 MiB per output stream), reports
+success / nonzero exit / timeout / cancellation / launch failure
+separately, and scrubs the configured API key from captured output.
+Plan mode holds shell proposals without applying, like file mutations.
+Shell effects cannot be undone — `/undo` says so explicitly instead of
+pretending. Project builds and tests run through the same system:
+`run_build` / `run_tests` proposals resolve `Cargo.toml`, `package.json`,
+`go.mod`, or `Makefile` in that order. No Git mutations yet (Phase 8).
 
 ## Project instructions (`AGENTS.md`)
 

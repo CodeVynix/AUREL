@@ -299,15 +299,7 @@ impl<P: ModelProvider> Repl<P> {
             }
             InputKind::Slash(command) => self.dispatch_slash(command, out, err),
             InputKind::ShellRequest(command) => {
-                if command.is_empty() {
-                    let _ = writeln!(err, "error: usage: !<command>");
-                } else {
-                    let shown = truncate(command, 200);
-                    let _ = writeln!(
-                        out,
-                        "Shell execution is not implemented yet — the shell-security phase will gate it. Received (not run): {shown}"
-                    );
-                }
+                self.queue_shell_request(command, out, err);
                 true
             }
             InputKind::Prompt { scope, text } => {
@@ -544,18 +536,29 @@ impl<P: ModelProvider> Repl<P> {
             }
         };
         for proposal in review_proposals(&context, &mut self.next_proposal_id, content, out, err) {
-            let _ = writeln!(out, "Proposal #{}: {}", proposal.id, proposal.op.summary());
-            let _ = write!(out, "{}", proposal.diff);
-            self.pending.push_back(proposal);
+            self.enqueue_prepared(proposal, out);
         }
         if !self.pending.is_empty() {
-            let _ = writeln!(out, "Review with /diff, then /approve [#id] or /deny.");
-            if self.session.mode() != Mode::Build {
-                let _ = writeln!(
-                    out,
-                    "Note: Plan mode holds proposals without applying — switch to Build to approve."
-                );
-            }
+            self.print_review_hint(out);
+        }
+    }
+
+    /// Queue one prepared proposal with its review display. Shared by
+    /// model-proposed collection and explicit `!` shell requests.
+    fn enqueue_prepared(&mut self, proposal: aurel_tools::PendingProposal, out: &mut dyn Write) {
+        let _ = writeln!(out, "Proposal #{}: {}", proposal.id, proposal.op.summary());
+        let _ = write!(out, "{}", proposal.diff);
+        self.pending.push_back(proposal);
+    }
+
+    /// The review hint shown after queueing, plus the Plan-mode hold note.
+    fn print_review_hint(&self, out: &mut dyn Write) {
+        let _ = writeln!(out, "Review with /diff, then /approve [#id] or /deny.");
+        if self.session.mode() != Mode::Build {
+            let _ = writeln!(
+                out,
+                "Note: Plan mode holds proposals without applying — switch to Build to approve."
+            );
         }
     }
 
@@ -600,9 +603,14 @@ impl<P: ModelProvider> Repl<P> {
             return;
         }
         let proposal = self.pending.pop_front().expect("front checked above");
-        match context.apply_mutation(&proposal.op, None) {
-            Ok(change) => {
+        // The configured key is scrubbed from any captured command output.
+        let redact = self.config.model.api_key.clone();
+        match context.apply_mutation(&proposal.op, redact.as_deref(), None) {
+            Ok((change, output)) => {
                 self.undo_stack.push(change);
+                if let Some(result) = output {
+                    print_command_result(&result, out);
+                }
                 let _ = writeln!(out, "Applied proposal #{}.", proposal.id);
             }
             Err(error) => {
@@ -708,6 +716,44 @@ impl<P: ModelProvider> Repl<P> {
                     "error: {} already exists (not overwriting; use /init --force to replace it)",
                     path.display()
                 );
+            }
+            Err(error) => {
+                let _ = writeln!(err, "{error}");
+            }
+        }
+    }
+
+    /// Handle an explicit `!` shell request: split into program + literal
+    /// arguments (no shell involved, ever), prepare it as a normal approval
+    /// proposal, and queue it for `/approve`. Plan mode holds it like any
+    /// other proposal. Nothing executes on this path.
+    fn queue_shell_request(&mut self, command: &str, out: &mut dyn Write, err: &mut dyn Write) {
+        let mut words = match split_shell_words(command) {
+            Ok(words) => words,
+            Err(error) => {
+                let _ = writeln!(err, "{error}");
+                return;
+            }
+        };
+        let program = words.remove(0);
+        let context = match self.tools() {
+            Ok(context) => context,
+            Err(error) => {
+                let _ = writeln!(err, "warning: cannot prepare proposals: {error}");
+                return;
+            }
+        };
+        let op = aurel_tools::MutationOp::RunCommand {
+            program,
+            args: words,
+            purpose: "explicit user shell request".to_string(),
+        };
+        let id = self.next_proposal_id;
+        match aurel_tools::prepare_proposal(&context, id, op) {
+            Ok(proposal) => {
+                self.next_proposal_id += 1;
+                self.enqueue_prepared(proposal, out);
+                self.print_review_hint(out);
             }
             Err(error) => {
                 let _ = writeln!(err, "{error}");
@@ -857,6 +903,54 @@ fn mutation_word(mode: Mode) -> &'static str {
     }
 }
 
+/// Print a shell execution result: one verdict line, the exit code, then
+/// captured output (already bounded and secret-scrubbed by the runner).
+fn print_command_result(result: &aurel_tools::CommandResult, out: &mut dyn Write) {
+    use aurel_tools::CommandStatus;
+    match result.status {
+        CommandStatus::Success => {
+            let _ = writeln!(out, "Command exited 0.");
+        }
+        CommandStatus::NonZeroExit => {
+            let _ = writeln!(
+                out,
+                "Command failed with exit code {}.",
+                result
+                    .exit_code
+                    .map(|code| code.to_string())
+                    .as_deref()
+                    .unwrap_or("?")
+            );
+        }
+        CommandStatus::Timeout => {
+            let _ = writeln!(out, "Command timed out ({}).", result.detail);
+        }
+        CommandStatus::Cancelled => {
+            let _ = writeln!(out, "Command cancelled.");
+        }
+        CommandStatus::LaunchFailed => {
+            let _ = writeln!(out, "Command failed to start: {}.", result.detail);
+        }
+    }
+    if !result.stdout.is_empty() {
+        let _ = writeln!(out, "--- stdout ---");
+        let _ = write!(out, "{}", result.stdout);
+        if !result.stdout.ends_with('\n') {
+            let _ = writeln!(out);
+        }
+    }
+    if !result.stderr.is_empty() {
+        let _ = writeln!(out, "--- stderr ---");
+        let _ = write!(out, "{}", result.stderr);
+        if !result.stderr.ends_with('\n') {
+            let _ = writeln!(out);
+        }
+    }
+    if result.truncated {
+        let _ = writeln!(out, "(output truncated to the per-stream cap)");
+    }
+}
+
 /// Parse fenced mutation blocks out of model output, prepare each against
 /// the workspace (resolve, snapshot, diff), print problems and diffs, and
 /// return the queueable proposals with fresh ids. Pure coordination over
@@ -913,6 +1007,77 @@ fn preview(content: &str) -> String {
     truncate(content, HISTORY_PREVIEW_CHARS).replace('\n', " ")
 }
 
+/// Split a `!` shell line into program + literal arguments: whitespace
+/// separates, double quotes group, backslash escapes the next character.
+/// Everything else (pipes, redirects, globs, variables, single quotes) is
+/// literal text — no shell ever interprets this line, so shell operators
+/// are rejected downstream as unresolvable programs rather than executed.
+fn split_shell_words(input: &str) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut has_word = false;
+    let mut chars = input.chars();
+    while let Some(char) = chars.next() {
+        if in_quotes {
+            match char {
+                '"' => in_quotes = false,
+                '\\' => match chars.next() {
+                    Some(escaped) => {
+                        has_word = true;
+                        current.push(escaped);
+                    }
+                    None => {
+                        has_word = true;
+                        current.push('\\');
+                    }
+                },
+                _ => {
+                    has_word = true;
+                    current.push(char);
+                }
+            }
+        } else {
+            match char {
+                '"' => {
+                    in_quotes = true;
+                    has_word = true;
+                }
+                '\\' => match chars.next() {
+                    Some(escaped) => {
+                        has_word = true;
+                        current.push(escaped);
+                    }
+                    None => {
+                        has_word = true;
+                        current.push('\\');
+                    }
+                },
+                _ if char.is_whitespace() => {
+                    if has_word {
+                        words.push(std::mem::take(&mut current));
+                        has_word = false;
+                    }
+                }
+                _ => {
+                    has_word = true;
+                    current.push(char);
+                }
+            }
+        }
+    }
+    if in_quotes {
+        return Err("error: unbalanced double quote (usage: !<program> [args])".to_string());
+    }
+    if has_word {
+        words.push(current);
+    }
+    if words.is_empty() {
+        return Err("error: usage: !<program> [args]".to_string());
+    }
+    Ok(words)
+}
+
 const REPL_HELP: &str = "\
 Commands (local — never sent to the model):
   /help                 Show this help
@@ -935,7 +1100,7 @@ Commands (local — never sent to the model):
   /undo                 Reverse the last AUREL-applied change
   /exit | /quit         Leave the loop
 @general / @explore prefix one prompt with a context scope.
-!command names an explicit shell request (not run yet).
+!command proposes a shell command for approval (direct execution, no shell).
 A bare Tab toggles Plan ↔ Build. Ctrl-D exits.";
 
 /// Build the provider/config snapshot from the live runtime and enter the
@@ -1179,10 +1344,15 @@ mod tests {
             assert!(out.contains(name), "catalog must list {name}: {out:?}");
         }
         assert!(out.contains("read-only"), "got: {out:?}");
-        let (cont, out, _) =
-            dispatch_to_string(&mut repl, &InputKind::ShellRequest("rm -rf /".into()));
+        let (cont, out, _) = dispatch_to_string(
+            &mut repl,
+            &InputKind::ShellRequest("cargo --version".into()),
+        );
         assert!(cont);
-        assert!(out.contains("not implemented yet") && out.contains("not run"));
+        // Explicit requests queue for approval — never execute inline.
+        assert!(out.contains("Proposal #1"), "got: {out:?}");
+        assert!(out.contains("cargo"), "got: {out:?}");
+        assert_eq!(repl.pending.len(), 1);
     }
 
     #[test]
@@ -1753,5 +1923,162 @@ mod tests {
         let err = String::from_utf8(err).expect("utf8");
         assert!(err.contains("proposal cap reached"), "got: {err:?}");
         let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn split_shell_words_handles_quoting() {
+        assert_eq!(
+            split_shell_words("cargo test --lib").expect("simple"),
+            vec!["cargo", "test", "--lib"]
+        );
+        assert_eq!(
+            split_shell_words("run \"my file.txt\" plain").expect("quoted"),
+            vec!["run", "my file.txt", "plain"]
+        );
+        assert_eq!(
+            split_shell_words("echo a\\ b c").expect("escaped"),
+            vec!["echo", "a b", "c"]
+        );
+        // Single quotes are literal (no shell to interpret them).
+        assert_eq!(
+            split_shell_words("echo 'hi'").expect("squotes"),
+            vec!["echo", "'hi'"]
+        );
+        assert!(split_shell_words("").is_err());
+        assert!(split_shell_words("   ").is_err());
+        assert!(split_shell_words("run \"oops").is_err());
+    }
+
+    #[test]
+    fn bang_queues_without_executing() {
+        let workdir = p6_workdir("bang-queue");
+        let mut repl = test_repl_in(vec![], workdir.clone());
+        let (cont, out, _) = dispatch_to_string(
+            &mut repl,
+            &InputKind::ShellRequest("cargo --version".into()),
+        );
+        assert!(cont);
+        assert!(out.contains("Proposal #1"), "got: {out:?}");
+        assert!(out.contains("explicit user shell request"), "got: {out:?}");
+        assert_eq!(repl.pending.len(), 1);
+        assert!(repl.undo_stack.is_empty(), "queueing must not record undo");
+        // Malformed shell lines are usage errors, not proposals.
+        let (cont, _, err) =
+            dispatch_to_string(&mut repl, &InputKind::ShellRequest("run \"oops".into()));
+        assert!(cont);
+        assert!(err.contains("unbalanced"), "got: {err:?}");
+        assert_eq!(repl.pending.len(), 1);
+        // Unknown programs are rejected with the program named.
+        let (cont, _, err) = dispatch_to_string(
+            &mut repl,
+            &InputKind::ShellRequest("aurel-no-such-program-xyz".into()),
+        );
+        assert!(cont);
+        assert!(err.contains("aurel-no-such-program-xyz"), "got: {err:?}");
+        assert_eq!(repl.pending.len(), 1);
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn bang_approve_runs_and_undo_reports_honestly() {
+        let workdir = p6_workdir("bang-run");
+        let mut repl = test_repl_in(vec![], workdir.clone());
+        dispatch_to_string(
+            &mut repl,
+            &InputKind::ShellRequest("cargo --version".into()),
+        );
+        assert_eq!(repl.pending.len(), 1);
+        let (cont, out, _) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Approve { id: None }),
+        );
+        assert!(cont);
+        assert!(out.contains("Command exited 0."), "got: {out:?}");
+        assert!(out.contains("cargo"), "got: {out:?}");
+        assert!(out.contains("Applied proposal #1"), "got: {out:?}");
+        assert!(repl.pending.is_empty());
+        assert_eq!(repl.undo_stack.len(), 1);
+        // Shell effects cannot be reversed: undo says so explicitly.
+        let (cont, _, err) = dispatch_to_string(&mut repl, &InputKind::Slash(SlashCommand::Undo));
+        assert!(cont);
+        assert!(err.contains("cannot undo"), "got: {err:?}");
+        assert!(repl.undo_stack.is_empty());
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn bang_plan_blocks_approval() {
+        let workdir = p6_workdir("bang-plan");
+        let mut repl = test_repl_in(vec![], workdir.clone());
+        repl.session.set_mode(Mode::Plan);
+        let (cont, out, _) = dispatch_to_string(
+            &mut repl,
+            &InputKind::ShellRequest("cargo --version".into()),
+        );
+        assert!(cont);
+        assert!(out.contains("Proposal #1"), "got: {out:?}");
+        assert!(out.contains("Plan mode"), "got: {out:?}");
+        let (cont, _, err) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Approve { id: None }),
+        );
+        assert!(cont);
+        assert!(err.contains("Plan"), "got: {err:?}");
+        assert_eq!(repl.pending.len(), 1);
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn print_command_result_shapes() {
+        use aurel_tools::{CommandResult, CommandStatus};
+        fn rendered(result: &CommandResult) -> String {
+            let mut out = Vec::new();
+            print_command_result(result, &mut out);
+            String::from_utf8(out).expect("utf8")
+        }
+        let base = CommandResult {
+            program: "p".into(),
+            status: CommandStatus::Success,
+            exit_code: Some(0),
+            stdout: "hi\n".into(),
+            stderr: String::new(),
+            truncated: false,
+            duration_ms: 3,
+            detail: String::new(),
+        };
+        assert!(rendered(&base).contains("Command exited 0."));
+        let failed = CommandResult {
+            status: CommandStatus::NonZeroExit,
+            exit_code: Some(2),
+            ..base.clone()
+        };
+        assert!(rendered(&failed).contains("exit code 2"));
+        let timed_out = CommandResult {
+            status: CommandStatus::Timeout,
+            exit_code: None,
+            detail: "exceeded 1s timeout".into(),
+            ..base.clone()
+        };
+        assert!(rendered(&timed_out).contains("timed out"));
+        let cancelled = CommandResult {
+            status: CommandStatus::Cancelled,
+            exit_code: None,
+            ..base.clone()
+        };
+        assert!(rendered(&cancelled).contains("cancelled"));
+        let launch = CommandResult {
+            status: CommandStatus::LaunchFailed,
+            exit_code: None,
+            detail: "spawn failed".into(),
+            ..base.clone()
+        };
+        assert!(rendered(&launch).contains("failed to start"));
+        let clipped = CommandResult {
+            stdout: "x".into(),
+            stderr: "y".into(),
+            truncated: true,
+            ..base.clone()
+        };
+        assert!(rendered(&clipped).contains("truncated"));
     }
 }
