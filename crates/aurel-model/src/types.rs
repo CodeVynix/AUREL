@@ -12,15 +12,20 @@ use std::sync::{
 ///
 /// Deliberately no string spelling here: each provider maps roles to its
 /// own wire format at its boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The `serde` spellings (`"system"`/`"user"`/`"assistant"`) are the
+/// stable session-file format (Phase 9) — never the provider wire format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Role {
     System,
     User,
     Assistant,
 }
 
-/// One conversation message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One conversation message. Serializable for session persistence; the
+/// stored form is plain data (role + content), never credentials.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: String,

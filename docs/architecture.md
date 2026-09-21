@@ -1,10 +1,10 @@
-# AUREL Architecture — Phase 8
+# AUREL Architecture — Phase 9
 
-This document describes what Phase 8 actually contains. Nothing more.
+This document describes what Phase 9 actually contains. Nothing more.
 
 ## Workspace
 
-Single Cargo workspace (`Cargo.toml`, `resolver = "2"`) with five members.
+Single Cargo workspace (`Cargo.toml`, `resolver = "2"`) with six members.
 Shared package metadata (`version`, `edition`, `rust-version`, `license`)
 is defined once in `[workspace.package]` and inherited by all crates, so
 there is one version definition feeding package metadata, the runtime
@@ -24,12 +24,16 @@ display (`aurel_core::version()`), and the test expectations:
   `AgentSession`, `AgentOutcome`). Owns the HTTP/TLS/JSON dependencies (see
   ADR-0006); nothing else in the workspace touches the network.
 - `crates/aurel-cli` — binary crate producing the `aurel` binary
-  (`[[bin]] name = "aurel"`). Depends on all four libraries via local path
+  (`[[bin]] name = "aurel"`). Depends on all five libraries via local path
   dependencies. Argument parsing itself is still dependency-free.
 - `crates/aurel-tools` — library crate (`aurel_tools`). Read-only
   inspection tools, `AGENTS.md` project instructions, and the approved
   file/shell/Git mutation layers. Only `serde`/`serde_json` beyond std,
   used solely for parsing model-proposed mutation blocks.
+- `crates/aurel-session` — library crate (`aurel_session`). Stable
+  session IDs plus the bounded JSON session store (history, mode,
+  workdir, project marker, counters — never secrets). Only
+  `serde`/`serde_json` beyond `aurel-model`, both already in the graph.
 
 The root manifest is workspace-only (no root package). `Cargo.lock` is
 committed because the workspace produces a binary.
@@ -221,20 +225,50 @@ streams throughout); piped input keeps the Phase 0 help behavior. One
   future tools must consult — Plan performs no mutations.
 - Slash commands are parsed and dispatched locally, never sent to the
   model: help/version/plan/build/status/compact/btw/new/history/context/
-  settings/config/tools/init/approve/deny/diff/undo/exit/quit. Backends
-  owned by later phases (`/model`, shell execution, cross-session
-  retrieval) say so instead of pretending.
+  settings/config/tools/init/approve/deny/diff/git/sessions/resume/
+  undo/exit/quit. The one honestly-unimplemented backend left is `/model`.
 - `@general` (default) and `@explore` annotate one prompt's scope;
-  `@explore` answers from the current session with an explicit notice.
+  `@explore` additionally prepends other saved sessions' summaries (plus
+  project metadata) to that request only — never stored in history.
 - `/btw` runs a side question on a private session clone and discards it:
-  history, mode, and counters are byte-identical afterwards.
+  history, mode, counters, and the session file are byte-identical
+  afterwards.
 - `/compact` (manual) and auto-compaction (on by default, threshold 20,
-  keeps 4) summarize through the model layer into one `system` message.
-- `/new` clears history, pending proposals, and undo state (mode
-  preserved). `/settings` toggles `auto_compaction` session-scoped — no
-  file writes except through the approval workflow below.
+  keeps 4) summarize through the model layer into one `system` message,
+  then persist; the summary survives resume.
+- `/new` mints a fresh session ID and clears history, pending proposals,
+  and undo state (mode preserved). `/sessions` lists saved sessions
+  newest-first; `/resume <id>` (unique prefixes allowed) restores
+  history, mode, and counters with an empty approval queue — resuming
+  executes nothing. `/settings` toggles `auto_compaction`
+  session-scoped — no file writes except through the approval workflow
+  and the session store below.
 - `!command` queues an explicit shell request into the same approval
   flow as file mutations (direct execution, no shell).
+
+## Sessions + cross-session context
+
+`crates/aurel-session` persists one JSON file per session
+(`<sessions-dir>/<id>.json`, format version 1) beside the global config.
+IDs (`YYYYMMDD-HHMMSS-xxxxxxxx`, UTC) validate as bare filenames, so
+they cannot escape the store; `/resume` additionally accepts unambiguous
+prefixes. Stored: history (leading compact summary plus the newest 200
+messages), mode, workdir, project marker, counters. Never stored: API
+keys or any configuration (no field exists), `AGENTS.md` instructions
+(reloaded live), pending proposals, or undo records — resuming restores
+a conversation with an empty approval queue and executes nothing.
+Writes are atomic (temp + rename); reads are bounded (2 MiB files, 5000
+messages) and validated (version, ID/filename agreement, mode spelling,
+timestamp order). Missing, ambiguous, corrupt, incompatible, oversized,
+and I/O failures are distinct typed `SessionError`s. The loop autosaves
+after prompts, compactions, and mode switches; save failures warn and
+continue in memory. Without a sessions directory everything degrades to
+in-memory sessions with one honest notice.
+
+`@explore` runs through `Agent::run_explore`: up to 5 other sessions'
+blurbs (500 chars each) plus project metadata ride that request as a
+leading `system` message on a private clone, then only the exchanged
+turn is copied back — the context never enters stored history.
 
 ## Configuration
 
@@ -403,3 +437,16 @@ and CLI approval labeling — no new crates.io graph entries, no async.
   Still far under the < 15 MB Core target.
 - Startup, warm process start-to-exit: release `--version` — unchanged;
   Git state builds per inspection/approval and costs nothing at startup.
+
+## Phase 9 delta (measured, informational)
+
+Same host and caveats as above. One new crate (`aurel-session`), serde
+derives on two model types, one config directory helper, and CLI wiring
+(`/sessions`, `/resume`, real `@explore`, autosave) — no new crates.io
+graph entries, no async.
+
+- Release binary: 3,474,944 bytes (≈3.31 MiB), i.e. +122,880 bytes
+  (+3.7%) vs Phase 8, mostly new code paths rather than dependencies.
+  Still far under the < 15 MB Core target.
+- Startup, warm process start-to-exit: release `--version` — unchanged;
+  the store opens once per loop and costs nothing at startup.

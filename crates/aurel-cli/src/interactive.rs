@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use aurel_config::EffectiveConfig;
 use aurel_model::{Agent, AgentConfig, AgentSession, CancelFlag, Mode, ModelProvider};
+use aurel_session::{SessionData, SessionId, SessionStore};
 use aurel_tools::{AppliedChange, InitOutcome, PendingProposal, AGENTS_MD};
 
 use super::{
@@ -90,6 +91,14 @@ pub enum SlashCommand {
     /// Read-only local Git inspection (`/git status|diff|branches|log`).
     /// Never mutates; allowed in both Plan and Build modes.
     Git(GitAction),
+    /// List saved persistent sessions (`/sessions`).
+    Sessions,
+    /// Resume a saved session (`/resume <id>`, unique prefixes allowed).
+    /// Restores history, mode, and counters only — never proposals, undo
+    /// records, or instructions, so resuming executes nothing.
+    Resume {
+        id: String,
+    },
     /// Reverse the last AUREL-applied change.
     Undo,
     Exit,
@@ -209,6 +218,10 @@ fn parse_slash(rest: &str) -> SlashCommand {
         },
         "diff" => SlashCommand::Diff,
         "git" => parse_git(args),
+        "sessions" => SlashCommand::Sessions,
+        "resume" => SlashCommand::Resume {
+            id: args.to_string(),
+        },
         "undo" => SlashCommand::Undo,
         "exit" | "quit" => SlashCommand::Exit,
         _ => SlashCommand::Unknown(name.to_string()),
@@ -271,6 +284,16 @@ pub struct Repl<P> {
     /// Inverses of AUREL-applied changes, newest last. Only these records
     /// can ever be undone — nothing the user did outside AUREL is here.
     undo_stack: Vec<AppliedChange>,
+    /// Stable ID of this persistent session (see `aurel-session`). A new
+    /// ID is minted per loop and per `/new`; `/resume` adopts the loaded
+    /// one. Shown in `/status`, used by `/sessions`.
+    session_id: SessionId,
+    /// Creation time of this session (0 = stamp on first save).
+    session_created_ms: u64,
+    /// Persistent session storage. `None` when no sessions directory is
+    /// available — the loop then works purely in memory, and `/sessions`,
+    /// `/resume`, and `@explore` retrieval report that honestly.
+    store: Option<SessionStore>,
 }
 
 impl<P: ModelProvider> Repl<P> {
@@ -278,6 +301,7 @@ impl<P: ModelProvider> Repl<P> {
         provider: P,
         config: EffectiveConfig,
         workdir: PathBuf,
+        store: Option<SessionStore>,
     ) -> Result<Self, aurel_model::ProviderError> {
         let agent = Agent::new(
             provider,
@@ -286,6 +310,10 @@ impl<P: ModelProvider> Repl<P> {
                 streaming: config.model.streaming,
             },
         )?;
+        let session_id = store
+            .as_ref()
+            .map(|store| store.create_id())
+            .unwrap_or_else(SessionId::generate);
         Ok(Repl {
             agent,
             session: AgentSession::new(),
@@ -296,6 +324,9 @@ impl<P: ModelProvider> Repl<P> {
             pending: VecDeque::new(),
             next_proposal_id: 1,
             undo_stack: Vec::new(),
+            session_id,
+            session_created_ms: 0,
+            store,
         })
     }
 
@@ -324,6 +355,7 @@ impl<P: ModelProvider> Repl<P> {
                     "Switched to {mode} mode (mutations {}).",
                     mutation_word(mode)
                 );
+                self.persist(err);
                 true
             }
             InputKind::Invalid(message) => {
@@ -360,11 +392,13 @@ impl<P: ModelProvider> Repl<P> {
             SlashCommand::Plan => {
                 self.session.set_mode(Mode::Plan);
                 let _ = writeln!(out, "Switched to plan mode (mutations blocked).");
+                self.persist(err);
                 true
             }
             SlashCommand::Build => {
                 self.session.set_mode(Mode::Build);
                 let _ = writeln!(out, "Switched to build mode (mutations allowed).");
+                self.persist(err);
                 true
             }
             SlashCommand::Status => {
@@ -385,10 +419,19 @@ impl<P: ModelProvider> Repl<P> {
                 self.compactions = 0;
                 self.pending.clear();
                 self.undo_stack.clear();
+                // A new conversation gets a new stable ID; the mode travels
+                // on. Nothing is written yet — the file appears on first save.
+                self.session_id = self
+                    .store
+                    .as_ref()
+                    .map(|store| store.create_id())
+                    .unwrap_or_else(SessionId::generate);
+                self.session_created_ms = 0;
                 let _ = writeln!(
                     out,
-                    "New session started (mode preserved: {}).",
-                    self.mode()
+                    "New session started (mode preserved: {}, id: {}).",
+                    self.mode(),
+                    self.session_id.as_str()
                 );
                 true
             }
@@ -439,6 +482,14 @@ impl<P: ModelProvider> Repl<P> {
                 self.run_git_action(action, out, err);
                 true
             }
+            SlashCommand::Sessions => {
+                self.run_sessions(out, err);
+                true
+            }
+            SlashCommand::Resume { id } => {
+                self.run_resume(id, out, err);
+                true
+            }
             SlashCommand::Undo => {
                 self.run_undo(out, err);
                 true
@@ -465,12 +516,6 @@ impl<P: ModelProvider> Repl<P> {
             let _ = writeln!(err, "error: no message given (type /help for commands)");
             return;
         }
-        if scope == ContextScope::Explore {
-            let _ = writeln!(
-                out,
-                "note: cross-session retrieval is not implemented yet; answering from the current session only."
-            );
-        }
         self.refresh_instructions(err);
         match self.agent.maybe_auto_compact(
             &mut self.session,
@@ -491,12 +536,28 @@ impl<P: ModelProvider> Repl<P> {
             }
         }
         let cancel = CancelFlag::new();
+        // The explore block is built before the sink borrows `out`: it
+        // prints its own retrieval notice first, then streams the answer.
+        let explore = if scope == ContextScope::Explore {
+            Some(self.explore_block(out))
+        } else {
+            None
+        };
         let mut sink = StreamSink::new(out);
-        let outcome = self
-            .agent
-            .run(&mut self.session, text, Some(&cancel), &mut |event| {
-                sink.on_event(event)
-            });
+        let outcome = match explore {
+            Some(block) => self.agent.run_explore(
+                &mut self.session,
+                &block,
+                text,
+                Some(&cancel),
+                &mut |event| sink.on_event(event),
+            ),
+            None => self
+                .agent
+                .run(&mut self.session, text, Some(&cancel), &mut |event| {
+                    sink.on_event(event)
+                }),
+        };
         self.iterations_used += outcome.result().iterations;
         let failed = sink.failed;
         let out = sink.out;
@@ -505,6 +566,48 @@ impl<P: ModelProvider> Repl<P> {
         // them for explicit review (never auto-applied).
         if matches!(outcome, aurel_model::AgentOutcome::Completed(_)) {
             self.collect_proposals(&outcome.result().content, out, err);
+        }
+        self.persist(err);
+    }
+
+    /// Build the one-shot `@explore` context block: other sessions'
+    /// summaries plus project metadata. The block rides the current request
+    /// only and is never stored; the printed line says exactly that.
+    fn explore_block(&self, out: &mut dyn Write) -> String {
+        match &self.store {
+            Some(store) => {
+                let others = store.summaries(&self.session_id);
+                if others.is_empty() {
+                    let _ = writeln!(
+                        out,
+                        "explore: no other saved sessions — answering from the current session plus project context."
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "explore: including context from {} other session(s) (this prompt only — nothing stored).",
+                        others.len()
+                    );
+                }
+                aurel_session::explore_context(
+                    &self.session_id,
+                    self.mode().into(),
+                    &self.workdir,
+                    &others,
+                )
+            }
+            None => {
+                let _ = writeln!(
+                    out,
+                    "note: session persistence is unavailable — answering from the current session only."
+                );
+                aurel_session::explore_context(
+                    &self.session_id,
+                    self.mode().into(),
+                    &self.workdir,
+                    &[],
+                )
+            }
         }
     }
 
@@ -546,6 +649,7 @@ impl<P: ModelProvider> Repl<P> {
                     "Compacted {} → {} messages (summary {} chars).",
                     report.messages_before, report.messages_after, report.summary_chars
                 );
+                self.persist(err);
             }
             Err(error) => {
                 let _ = writeln!(err, "{error}");
@@ -558,6 +662,41 @@ impl<P: ModelProvider> Repl<P> {
     /// on a stale handle.
     fn tools(&self) -> Result<aurel_tools::ToolContext, aurel_tools::ToolError> {
         aurel_tools::ToolContext::new(&self.workdir)
+    }
+
+    /// Snapshot the resumable conversation state: history, mode, workdir,
+    /// project marker, and counters. Pending proposals, undo records,
+    /// instructions, and configuration are deliberately absent — resuming
+    /// restores a conversation, never an approval queue or credentials.
+    fn snapshot(&self) -> SessionData {
+        SessionData {
+            id: self.session_id.clone(),
+            created_ms: self.session_created_ms,
+            updated_ms: 0,
+            mode: self.mode().into(),
+            workdir: self.workdir.display().to_string(),
+            project_kind: aurel_tools::detect_build_commands(&self.workdir)
+                .map(|commands| commands.kind.to_string()),
+            history: self.session.history().to_vec(),
+            iterations_used: self.iterations_used,
+            compactions: self.compactions,
+        }
+    }
+
+    /// Persist the current snapshot. Best-effort by design: storage
+    /// failures warn and the loop continues in memory — a session must
+    /// never fail because its save did.
+    fn persist(&self, err: &mut dyn Write) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        if let Err(error) = store.save(&self.snapshot()) {
+            let _ = writeln!(
+                err,
+                "warning: could not save session {}: {error} (continuing in memory)",
+                self.session_id.as_str()
+            );
+        }
     }
 
     /// Collect model-proposed mutations from a completed turn into the
@@ -791,6 +930,95 @@ impl<P: ModelProvider> Repl<P> {
         }
     }
 
+    /// List saved persistent sessions, newest first. The current session is
+    /// marked with `*`. Read-only: works in both modes.
+    fn run_sessions(&self, out: &mut dyn Write, err: &mut dyn Write) {
+        let Some(store) = &self.store else {
+            let _ = writeln!(
+                err,
+                "error: session persistence is unavailable (no sessions directory)"
+            );
+            return;
+        };
+        let listed = store.list();
+        if listed.is_empty() {
+            let _ = writeln!(out, "No saved sessions yet.");
+            return;
+        }
+        let _ = writeln!(out, "sessions ({}):", listed.len());
+        for meta in listed {
+            let marker = if meta.id == self.session_id { "*" } else { " " };
+            let _ = writeln!(
+                out,
+                "{marker} {}  {}  {} msgs  updated {}  {}",
+                meta.id.as_str(),
+                meta.mode.as_str(),
+                meta.message_count,
+                aurel_session::describe_age(meta.updated_ms),
+                meta.workdir
+            );
+        }
+    }
+
+    /// Resume a saved session by ID or unambiguous prefix. Restores history,
+    /// mode, and counters only: pending proposals and undo records start
+    /// empty (they are never persisted), and instructions reload live from
+    /// the working directory. Resuming therefore cannot execute anything.
+    fn run_resume(&mut self, id: &str, out: &mut dyn Write, err: &mut dyn Write) {
+        if id.trim().is_empty() {
+            let _ = writeln!(err, "error: usage: /resume <id> (see /sessions)");
+            return;
+        }
+        let data = match &self.store {
+            Some(store) => match store.load(id.trim()) {
+                Ok(data) => data,
+                Err(error) => {
+                    let _ = writeln!(err, "{error}");
+                    return;
+                }
+            },
+            None => {
+                let _ = writeln!(
+                    err,
+                    "error: session persistence is unavailable (no sessions directory)"
+                );
+                return;
+            }
+        };
+        self.session = AgentSession::new();
+        for message in &data.history {
+            self.session.push(message.clone());
+        }
+        self.session.set_mode(data.mode.into());
+        self.refresh_instructions(err);
+        self.session_id = data.id;
+        self.session_created_ms = data.created_ms;
+        self.iterations_used = data.iterations_used;
+        self.compactions = data.compactions;
+        self.pending.clear();
+        self.undo_stack.clear();
+        let _ = writeln!(
+            out,
+            "Resumed session {} ({} messages, {} mode).",
+            self.session_id.as_str(),
+            self.session.history().len(),
+            self.mode()
+        );
+        let _ = writeln!(
+            out,
+            "Pending proposals and undo history start empty — nothing was executed."
+        );
+        if data.workdir != self.workdir.display().to_string() {
+            let _ = writeln!(
+                out,
+                "Note: this session was started in '{}'; continuing in '{}'.",
+                data.workdir,
+                self.workdir.display()
+            );
+        }
+        self.persist(err);
+    }
+
     /// Reverse the last AUREL-applied change. Only inverses recorded in the
     /// session undo stack can run here, so undo never touches anything
     /// AUREL did not itself change.
@@ -936,6 +1164,15 @@ impl<P: ModelProvider> Repl<P> {
         let _ = writeln!(out, "compactions: {}", self.compactions);
         let _ = writeln!(out, "pending proposals: {}", self.pending.len());
         let _ = writeln!(out, "undo depth: {}", self.undo_stack.len());
+        let _ = writeln!(out, "session id: {}", self.session_id.as_str());
+        match &self.store {
+            Some(store) => {
+                let _ = writeln!(out, "sessions dir: {}", store.dir().display());
+            }
+            None => {
+                let _ = writeln!(out, "sessions dir: (unavailable — running in memory)");
+            }
+        }
     }
 
     fn print_history(&self, out: &mut dyn Write) {
@@ -958,7 +1195,7 @@ impl<P: ModelProvider> Repl<P> {
         let chars: usize = self.session.history().iter().map(|m| m.content.len()).sum();
         let _ = writeln!(
             out,
-            "scope: general (per-message @general/@explore; @explore answers from this session — cross-session retrieval is not implemented yet)"
+            "scope: general (per-message @general/@explore; @explore pulls other saved sessions' summaries into that prompt only)"
         );
         let _ = writeln!(
             out,
@@ -1282,9 +1519,11 @@ Commands (local — never sent to the model):
   /version              Print the version
   /plan | /build        Switch modes (Tab toggles)
   /status               Session and configuration summary
-  /compact              Summarize history into a compacted session
-  /btw <question>       Side question (main task untouched)
-  /new                  Start a fresh session
+   /compact              Summarize history into a compacted session
+   /btw <question>       Side question (main task untouched)
+   /new                  Start a fresh session (new id, mode preserved)
+   /sessions             List saved persistent sessions (newest first)
+   /resume <id>          Resume a saved session (history/mode/counters only)
   /history              Show session messages
   /context              Show context scope and usage
   /settings [show|set]  View or change session settings
@@ -1300,6 +1539,7 @@ Commands (local — never sent to the model):
   /undo                 Reverse the last AUREL-applied change
   /exit | /quit         Leave the loop
 @general / @explore prefix one prompt with a context scope.
+@explore also pulls other saved sessions' summaries into that prompt only.
 !command proposes a shell command for approval (direct execution, no shell).
 A bare Tab toggles Plan ↔ Build. Ctrl-D exits.";
 
@@ -1327,7 +1567,29 @@ pub fn start_interactive(
             return EXIT_RUNTIME_ERROR;
         }
     };
-    let mut repl = match Repl::new(provider, cfg, rt.cwd.clone()) {
+    // Persistent sessions live beside the global config. A missing or
+    // unusable directory degrades to in-memory sessions with one warning —
+    // the loop itself must never fail because storage did.
+    let store = match aurel_config::global_sessions_dir(rt.appdata.as_deref(), rt.home.as_deref()) {
+        Some(dir) => match aurel_session::SessionStore::open(&dir) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                let _ = writeln!(
+                    err,
+                    "warning: {error} (continuing without session persistence)"
+                );
+                None
+            }
+        },
+        None => {
+            let _ = writeln!(
+                err,
+                "warning: no home directory found (continuing without session persistence)"
+            );
+            None
+        }
+    };
+    let mut repl = match Repl::new(provider, cfg, rt.cwd.clone(), store) {
         Ok(repl) => repl,
         Err(error) => {
             let _ = writeln!(err, "{error}");
@@ -1428,6 +1690,14 @@ mod tests {
         script: Vec<Result<aurel_model::ChatResponse, aurel_model::ProviderError>>,
         workdir: std::path::PathBuf,
     ) -> Repl<ScriptedProvider> {
+        test_repl_in_store(script, workdir, None)
+    }
+
+    fn test_repl_in_store(
+        script: Vec<Result<aurel_model::ChatResponse, aurel_model::ProviderError>>,
+        workdir: std::path::PathBuf,
+        store: Option<SessionStore>,
+    ) -> Repl<ScriptedProvider> {
         std::fs::create_dir_all(&workdir).expect("test workdir");
         let cfg = aurel_config::load(&LoadRequest::default()).expect("defaults load");
         Repl::new(
@@ -1438,8 +1708,17 @@ mod tests {
             },
             cfg,
             workdir,
+            store,
         )
         .expect("repl builds")
+    }
+
+    /// A real on-disk session store in an isolated temp directory.
+    fn test_store(name: &str) -> SessionStore {
+        let dir =
+            std::env::temp_dir().join(format!("aurel-repl-store-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        SessionStore::open(&dir).expect("test store opens")
     }
 
     fn dispatch_to_string(
@@ -2674,5 +2953,359 @@ mod tests {
             text.contains("nothing to commit"),
             "git errors must be shown: {text:?}"
         );
+    }
+
+    // -- Phase 9: sessions -------------------------------------------------
+
+    fn session_workdir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("aurel-sess-repl-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test workdir");
+        dir
+    }
+
+    fn stored_file(store: &SessionStore, id: &str) -> PathBuf {
+        store.dir().join(format!("{id}.json"))
+    }
+
+    #[test]
+    fn parses_session_command_shapes() {
+        assert_eq!(
+            parse_input_line("/sessions"),
+            InputKind::Slash(SlashCommand::Sessions)
+        );
+        assert_eq!(
+            parse_input_line("/resume abc123"),
+            InputKind::Slash(SlashCommand::Resume {
+                id: "abc123".into()
+            })
+        );
+        // Missing IDs stay parseable so dispatch can print usage (like /btw).
+        assert_eq!(
+            parse_input_line("/resume"),
+            InputKind::Slash(SlashCommand::Resume { id: "".into() })
+        );
+        assert!(matches!(
+            parse_input_line("/resumex"),
+            InputKind::Slash(SlashCommand::Unknown(_))
+        ));
+    }
+
+    #[test]
+    fn prompts_persist_and_sessions_lists_with_current_marked() {
+        let store = test_store("list");
+        let workdir = session_workdir("list");
+        let mut repl = test_repl_in_store(
+            vec![ScriptedProvider::reply("hi there")],
+            workdir.clone(),
+            Some(store.clone()),
+        );
+
+        // Nothing saved before the first prompt: no litter.
+        assert!(std::fs::read_dir(store.dir())
+            .expect("read")
+            .next()
+            .is_none());
+        let (cont, _, _) = dispatch_to_string(&mut repl, &prompt("hello".into()));
+        assert!(cont);
+        let id = repl.session_id.as_str().to_string();
+
+        // The file holds history, mode, and counters — and no secrets.
+        let raw = std::fs::read_to_string(stored_file(&store, &id)).expect("session file");
+        assert!(
+            raw.contains("hello") && raw.contains("hi there"),
+            "got: {raw:?}"
+        );
+        assert!(raw.contains("\"build\""), "got: {raw:?}");
+        assert!(!raw.to_lowercase().contains("api_key"), "got: {raw:?}");
+
+        let (cont, out, _) =
+            dispatch_to_string(&mut repl, &InputKind::Slash(SlashCommand::Sessions));
+        assert!(cont);
+        assert!(out.contains("sessions (1):"), "got: {out:?}");
+        assert!(out.contains(&id), "got: {out:?}");
+        assert!(out.contains("*"), "current session must be marked: {out:?}");
+        assert!(out.contains("2 msgs"), "got: {out:?}");
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn resume_restores_history_mode_and_counters_without_executing() {
+        let store = test_store("resume");
+        let workdir = session_workdir("resume");
+        let reply = fence(r#"{"op": "create_file", "path": "made.txt", "content": "x"}"#);
+        let mut repl = test_repl_in_store(
+            vec![ScriptedProvider::reply(&reply)],
+            workdir.clone(),
+            Some(store.clone()),
+        );
+        dispatch_to_string(&mut repl, &InputKind::Slash(SlashCommand::Plan));
+        dispatch_to_string(&mut repl, &prompt("plan something".into()));
+        let id = repl.session_id.as_str().to_string();
+        assert_eq!(repl.pending.len(), 1, "proposal queued, not executed");
+
+        // A fresh loop resumes by ID: history, mode, and counters return;
+        // the approval queue starts empty and nothing runs.
+        let mut revived = test_repl_in_store(vec![], workdir.clone(), Some(store.clone()));
+        let (cont, out, _) = dispatch_to_string(
+            &mut revived,
+            &InputKind::Slash(SlashCommand::Resume { id: id.clone() }),
+        );
+        assert!(cont);
+        assert!(out.contains(&id), "got: {out:?}");
+        assert!(out.contains("2 messages"), "got: {out:?}");
+        assert!(out.contains("plan mode"), "got: {out:?}");
+        assert!(out.contains("nothing was executed"), "got: {out:?}");
+        assert_eq!(revived.mode(), Mode::Plan);
+        assert_eq!(revived.session.history().len(), 2);
+        assert!(revived.pending.is_empty());
+        assert!(revived.undo_stack.is_empty());
+        assert!(!workdir.join("made.txt").exists());
+
+        // Unique prefixes resolve too.
+        let mut prefixed = test_repl_in_store(vec![], workdir.clone(), Some(store.clone()));
+        let (cont, out, _) = dispatch_to_string(
+            &mut prefixed,
+            &InputKind::Slash(SlashCommand::Resume {
+                id: id[..8].to_string(),
+            }),
+        );
+        assert!(cont);
+        assert!(out.contains("Resumed session"), "got: {out:?}");
+
+        // Counters survive the round trip (one prompt ran above).
+        let (cont, out, _) =
+            dispatch_to_string(&mut revived, &InputKind::Slash(SlashCommand::Status));
+        assert!(cont);
+        assert!(out.contains("iterations used: 1"), "got: {out:?}");
+        assert!(out.contains(&format!("session id: {id}")), "got: {out:?}");
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn resume_rejects_unknown_bad_and_corrupt_ids() {
+        let store = test_store("resume-bad");
+        let workdir = session_workdir("resume-bad");
+        let mut repl = test_repl_in_store(vec![], workdir.clone(), Some(store.clone()));
+
+        let (cont, _, err) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Resume { id: "".into() }),
+        );
+        assert!(cont);
+        assert!(err.contains("usage: /resume"), "got: {err:?}");
+
+        let (cont, _, err) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Resume {
+                id: "20260918-120301-deadbeef".into(),
+            }),
+        );
+        assert!(cont);
+        assert!(err.contains("no such session"), "got: {err:?}");
+
+        let (cont, _, err) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Resume {
+                id: "../evil".into(),
+            }),
+        );
+        assert!(cont);
+        assert!(err.contains("invalid session id"), "got: {err:?}");
+
+        // A corrupt file fails loudly and leaves the live session alone.
+        let bad = SessionId::generate();
+        std::fs::write(stored_file(&store, bad.as_str()), b"{not json").expect("write");
+        let before = repl.session.history().len();
+        let (cont, _, err) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Resume {
+                id: bad.as_str().to_string(),
+            }),
+        );
+        assert!(cont);
+        assert!(err.contains("corrupt session file"), "got: {err:?}");
+        assert_eq!(repl.session.history().len(), before);
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn new_starts_a_fresh_conversation_but_keeps_saved_history() {
+        let store = test_store("new");
+        let workdir = session_workdir("new");
+        let mut repl = test_repl_in_store(
+            vec![ScriptedProvider::reply("first answer")],
+            workdir.clone(),
+            Some(store.clone()),
+        );
+        dispatch_to_string(&mut repl, &prompt("first".into()));
+        let old_id = repl.session_id.as_str().to_string();
+
+        let (cont, out, _) = dispatch_to_string(&mut repl, &InputKind::Slash(SlashCommand::New));
+        assert!(cont);
+        assert!(out.contains("New session started"), "got: {out:?}");
+        assert!(repl.session.history().is_empty());
+        let new_id = repl.session_id.as_str().to_string();
+        assert_ne!(old_id, new_id, "a fresh conversation gets a fresh id");
+
+        // The old conversation is still resumable from disk.
+        let mut revived = test_repl_in_store(vec![], workdir.clone(), Some(store.clone()));
+        let (cont, out, _) = dispatch_to_string(
+            &mut revived,
+            &InputKind::Slash(SlashCommand::Resume { id: old_id }),
+        );
+        assert!(cont);
+        assert!(out.contains("2 messages"), "got: {out:?}");
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn btw_leaves_the_persisted_session_untouched() {
+        let store = test_store("btw");
+        let workdir = session_workdir("btw");
+        let mut repl = test_repl_in_store(
+            vec![
+                ScriptedProvider::reply("main answer"),
+                ScriptedProvider::reply("side answer"),
+            ],
+            workdir.clone(),
+            Some(store.clone()),
+        );
+        dispatch_to_string(&mut repl, &prompt("main task".into()));
+        let id = repl.session_id.as_str().to_string();
+        let saved = std::fs::read(stored_file(&store, &id)).expect("session file");
+
+        let (cont, out, _) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Btw("side question".into())),
+        );
+        assert!(cont);
+        assert!(out.contains("side answer"), "got: {out:?}");
+        // The side question touched neither memory nor disk.
+        assert_eq!(repl.session.history().len(), 2);
+        assert_eq!(
+            std::fs::read(stored_file(&store, &id)).expect("reread"),
+            saved,
+            "a /btw must not rewrite the session file"
+        );
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn compact_then_resume_keeps_the_summary() {
+        let store = test_store("compact");
+        let workdir = session_workdir("compact");
+        let mut repl = test_repl_in_store(
+            vec![
+                ScriptedProvider::reply("one"),
+                ScriptedProvider::reply("two"),
+                ScriptedProvider::reply("three"),
+                ScriptedProvider::reply("SUMMARY"),
+            ],
+            workdir.clone(),
+            Some(store.clone()),
+        );
+        for word in ["one", "two", "three"] {
+            dispatch_to_string(&mut repl, &prompt(word.into()));
+        }
+        assert_eq!(repl.session.history().len(), 6);
+        let (cont, out, _) =
+            dispatch_to_string(&mut repl, &InputKind::Slash(SlashCommand::Compact));
+        assert!(cont);
+        assert!(out.contains("Compacted 6 → 5 messages"), "got: {out:?}");
+        assert!(repl.session.history()[0]
+            .content
+            .starts_with("Session summary:"));
+
+        let mut revived = test_repl_in_store(vec![], workdir.clone(), Some(store.clone()));
+        let id = repl.session_id.as_str().to_string();
+        let (cont, out, _) =
+            dispatch_to_string(&mut revived, &InputKind::Slash(SlashCommand::Resume { id }));
+        assert!(cont);
+        assert!(out.contains("5 messages"), "got: {out:?}");
+        assert!(
+            revived.session.history()[0]
+                .content
+                .starts_with("Session summary:"),
+            "compaction summary must survive the round trip"
+        );
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn explore_pulls_other_session_context_without_storing_it() {
+        let store = test_store("explore");
+        let dir_a = session_workdir("explore-a");
+        let dir_b = session_workdir("explore-b");
+        let mut repl_a = test_repl_in_store(
+            vec![ScriptedProvider::reply("alpha answer")],
+            dir_a.clone(),
+            Some(store.clone()),
+        );
+        dispatch_to_string(&mut repl_a, &prompt("alpha work".into()));
+
+        let mut repl_b = test_repl_in_store(
+            vec![ScriptedProvider::reply("beta answer")],
+            dir_b.clone(),
+            Some(store.clone()),
+        );
+        let (cont, out, _) = dispatch_to_string(
+            &mut repl_b,
+            &InputKind::Prompt {
+                scope: ContextScope::Explore,
+                text: "what relates?".into(),
+            },
+        );
+        assert!(cont);
+        assert!(out.contains("other session(s)"), "got: {out:?}");
+        assert!(out.contains("beta answer"), "got: {out:?}");
+
+        // The provider saw A's summary; B's stored history holds only its
+        // own exchange.
+        let seen = repl_b.agent.provider().seen.borrow();
+        assert_eq!(seen.len(), 1);
+        let context_first = seen[0]
+            .iter()
+            .find(|message| message.content.contains("alpha work"));
+        assert!(
+            context_first.is_some(),
+            "provider must see cross-session context: {:?}",
+            seen[0]
+                .iter()
+                .map(|message| &message.content)
+                .collect::<Vec<_>>()
+        );
+        let stored: Vec<&str> = repl_b
+            .session
+            .history()
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(stored, ["what relates?", "beta answer"]);
+        assert!(
+            !stored.iter().any(|content| content.contains("alpha work")),
+            "explore context must not persist: {stored:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    #[test]
+    fn sessions_degrade_honestly_without_a_store() {
+        let mut repl = test_repl(vec![]);
+        let (cont, _, err) =
+            dispatch_to_string(&mut repl, &InputKind::Slash(SlashCommand::Sessions));
+        assert!(cont);
+        assert!(err.contains("unavailable"), "got: {err:?}");
+        let (cont, _, err) = dispatch_to_string(
+            &mut repl,
+            &InputKind::Slash(SlashCommand::Resume { id: "abc".into() }),
+        );
+        assert!(cont);
+        assert!(err.contains("unavailable"), "got: {err:?}");
+        // Plain prompts still work in memory.
+        let (cont, _, _) = dispatch_to_string(&mut repl, &InputKind::Slash(SlashCommand::Status));
+        assert!(cont);
     }
 }

@@ -4,14 +4,12 @@ AUREL is a personal, terminal-first AI coding agent. This repository holds its
 Rust implementation, built as one shared foundation with a lightweight Core
 edition and (later) an extended Normal edition.
 
-> **Status: Phase 8 — Git mutations.** `/git status|diff|branches|log`
-> inspects the workspace repo (read-only, local only), and the
-> `git_stage` / `git_unstage` / `git_commit` / `git_create_branch` /
-> `git_switch_branch` proposal ops mutate it behind the same explicit
-> approval workflow as file mutations: Build proposes, Plan blocks,
-> `/approve` runs the exact shown `git` argv, `/undo` honestly refuses
-> (undo never rewrites history). Local operations only — no push, pull,
-> fetch, merge, remotes, or PRs. There is still no memory, no GUI, and no
+> **Status: Phase 9 — Context + session resumption.** Conversations
+> persist as bounded JSON sessions (`/sessions`, `/resume <id>`) with
+> stable IDs, and `@explore` pulls other sessions' summaries into one
+> prompt only. Resuming restores history, mode, and counters — never
+> proposals, undo records, instructions, or secrets, so it executes
+> nothing. There is still no memory beyond saved sessions, no GUI, and no
 > Normal edition.
 
 ## Toolchain
@@ -73,13 +71,13 @@ plan> hello
 Actual `--version` output:
 
 ```text
-aurel 0.9.0
+aurel 0.10.0
 ```
 
 Actual `--help` output:
 
 ```text
-aurel 0.9.0
+aurel 0.10.0
 Autonomous Utility & Reasoning Engine for Logic
 
 USAGE:
@@ -117,7 +115,7 @@ Behavior:
 | ---------- | --------- | ------ |
 | `aurel` | 0 | help to stdout (config files untouched) |
 | `aurel --help` / `-h` | 0 | help to stdout |
-| `aurel --version` / `-V` | 0 | `aurel 0.9.0` to stdout |
+| `aurel --version` / `-V` | 0 | `aurel 0.10.0` to stdout |
 | `aurel config show` | 0 | effective config as TOML to stdout (key redacted) |
 | `aurel config` / `aurel config --help` | 0 | command help to stdout |
 | `aurel chat "hi"` | 0 | model reply to stdout |
@@ -169,9 +167,11 @@ one-shot (`aurel agent "hi"`, `aurel chat "hi"`, `aurel config show`).
 | `Tab` (bare) | Toggle Plan ↔ Build |
 | `/plan`, `/build` | Switch mode (shown in prompt and `/status`) |
 | `/help`, `/version`, `/status`, `/history`, `/context` | Local reports |
-| `/compact` | Summarize history via the model, keep going |
-| `/btw <q>` | Side answer without touching the main task |
-| `/new` | Fresh session (mode preserved) |
+| `/compact` | Summarize history via the model, keep going (persisted) |
+| `/btw <q>` | Side answer without touching the main task or its file |
+| `/new` | Fresh conversation: new id, history/queue/undo cleared, mode kept |
+| `/sessions` | List saved persistent sessions (newest first, `*` = current) |
+| `/resume <id>` | Resume a session: history/mode/counters back, queue starts empty |
 | `/settings [show\|set auto_compaction on\|off]` | Session-scoped settings |
 | `/config` | Effective config (key redacted) |
 | `/model` | Honestly reports its backend is unimplemented |
@@ -181,7 +181,7 @@ one-shot (`aurel agent "hi"`, `aurel chat "hi"`, `aurel config show`).
 | `/diff` | Re-show the pending proposal diff |
 | `/git <status|diff|branches|log>` | Inspect the workspace Git repo (read-only, local only) |
 | `/undo` | Reverse the last AUREL-applied change |
-| `@general`, `@explore` | Prompt scope (`@explore` notes cross-session is future) |
+| `@general`, `@explore` | Prompt scope (`@explore` pulls other saved sessions' summaries into that prompt only) |
 | `!command` | Queues a shell command for approval (direct execution, no shell) |
 | blank line | Prints the input hint, then reprompts |
 | `/exit`, `/quit`, Ctrl-D | Leave the loop |
@@ -263,6 +263,33 @@ constructors, a runtime guard, and a regression test pinning that. Applied
 Git operations are recorded for audit but never undone — `/undo` refuses,
 because undoing them would mean rewriting history.
 
+## Sessions + cross-session context
+
+Every loop owns a stable session ID (`YYYYMMDD-HHMMSS-xxxxxxxx`, shown in
+`/status`). Prompts, compactions, and mode switches autosave a bounded
+JSON file beside the global config (`<config-dir>/sessions/<id>.json`;
+`~/.config/aurel/sessions` on Unix, `%APPDATA%\aurel\sessions` on
+Windows). Stored: conversation history (leading compact summary plus the
+newest 200 messages), Plan/Build mode, working directory, project
+marker, and loop counters. Never stored: API keys or any configuration,
+`AGENTS.md` instructions (reloaded live), pending proposals, or undo
+records.
+
+`/sessions` lists saved sessions newest-first (`*` marks the current
+one); `/resume <id>` (unique prefixes allowed) restores history, mode,
+and counters with an empty approval queue — resuming executes nothing,
+and a workdir mismatch only warns. `/new` mints a fresh ID and clears
+history, queue, and undo state (mode preserved). `/btw` answers on a
+private clone and never touches the saved file. `/compact` summaries
+persist and survive resume. Missing, corrupt, incompatible-version, or
+oversized session files fail as typed errors naming the file; the live
+loop is never disturbed. Without a sessions directory the loop runs
+purely in memory and says so.
+
+`@explore` answers with real cross-session context: up to 5 other
+sessions' summaries (500 chars each) plus project metadata ride that one
+request as a leading `system` message — never stored in history.
+
 ## Project instructions (`AGENTS.md`)
 
 `/init` writes a starter `AGENTS.md` into the working directory — only
@@ -295,6 +322,7 @@ crates/aurel-core/          # shared library foundation (version API)
 crates/aurel-config/        # TOML loading, precedence, discovery, config errors
 crates/aurel-model/         # provider abstraction + OpenAI-compatible provider + agent loop
 crates/aurel-tools/         # inspection + AGENTS.md + approved file/shell/Git mutations
+crates/aurel-session/      # stable IDs + bounded JSON session store (serde only, in-graph)
 crates/aurel-cli/           # `aurel` binary: std-only arg parser + dispatch + interactive loop
 docs/architecture.md        # what the current phase actually contains
 docs/configuration.md      # config precedence, grammar, errors

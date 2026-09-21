@@ -640,8 +640,32 @@ pub fn global_config_file(appdata: Option<&str>, home: Option<&str>) -> Option<P
     }
 }
 
+/// Resolve the global sessions directory from already-read directory
+/// values: `%APPDATA%\aurel\sessions` on Windows,
+/// `~/.config/aurel/sessions` elsewhere — the same `aurel` home as the
+/// global config file, so one directory pair explains all AUREL state.
+/// Returns `None` when the relevant value is absent or empty.
+pub fn global_sessions_dir(appdata: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let _ = home;
+        appdata
+            .filter(|s| !s.is_empty())
+            .map(|dir| Path::new(dir).join("aurel").join("sessions"))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = appdata;
+        home.filter(|s| !s.is_empty()).map(|dir| {
+            Path::new(dir)
+                .join(".config")
+                .join("aurel")
+                .join("sessions")
+        })
+    }
+}
+
 /// Search `start` and its ancestors for `.aurel/config.toml`, nearest first.
-///
 /// The walk is bounded (64 levels) and stops at the filesystem root.
 /// Returns `None` when no ancestor holds the file.
 pub fn discover_project_file(start: &Path) -> Option<PathBuf> {

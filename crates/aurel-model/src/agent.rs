@@ -97,13 +97,17 @@ impl Default for AgentConfig {
     }
 }
 
-/// In-memory conversation history for one agent session. No persistence
-/// (sessions are Phase 8); dropped with the process.
+/// In-memory conversation history for one agent session. Persisted across
+/// runs by the session layer (Phase 9: stable IDs, bounded JSON files —
+/// history, mode, and counters only, never credentials); dropped with the
+/// process when persistence is unavailable.
 ///
 /// Also carries the interaction [`Mode`] and optional project instructions
 /// (`AGENTS.md` content): `/new` (via [`AgentSession::clear`]) resets
 /// history but preserves the mode. Instructions are *not* history —
-/// [`Agent::run`] prepends them to each request without storing them.
+/// [`Agent::run`] prepends them to each request without storing them, and
+/// the session layer never writes them to disk (they reload live from the
+/// working directory on every run and every resume).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct AgentSession {
     history: Vec<Message>,
@@ -340,6 +344,42 @@ impl<P: ModelProvider> Agent<P> {
     ) -> AgentOutcome {
         let mut scratch = session.clone();
         self.run(&mut scratch, question, cancel, on_event)
+    }
+
+    /// Answer with cross-session context without storing that context: the
+    /// run executes against a private clone whose front carries
+    /// `context_block` (other sessions' summaries, project metadata) as a
+    /// leading `system` message, then the exchanged messages (user turn
+    /// plus replies, never the context block itself) are appended to the
+    /// real `session`. The caller persists afterwards exactly like a normal
+    /// prompt. The context block rides this request only.
+    pub fn run_explore(
+        &self,
+        session: &mut AgentSession,
+        context_block: &str,
+        user_input: &str,
+        cancel: Option<&CancelFlag>,
+        on_event: &mut dyn FnMut(StreamEvent) -> StreamControl,
+    ) -> AgentOutcome {
+        let before = session.history.len() + 1;
+        let mut scratch = session.clone();
+        scratch
+            .history
+            .insert(0, Message::system(context_block.to_string()));
+        let outcome = self.run(&mut scratch, user_input, cancel, on_event);
+        // Copy back exactly what the turn exchanged: everything past the
+        // context block. The block itself never enters stored history.
+        session
+            .history
+            .extend(scratch.history[before..].iter().cloned());
+        debug_assert!(
+            !session
+                .history
+                .iter()
+                .any(|message| message.content == context_block),
+            "explore context must not persist into history"
+        );
+        outcome
     }
 
     /// Whether `session` has grown past the auto-compaction threshold.
@@ -1077,5 +1117,48 @@ mod tests {
         assert_eq!(session.history()[1].content, "main-answer");
         assert_eq!(session.mode(), Mode::Plan);
         assert_eq!(agent.provider().calls.get(), 2);
+    }
+
+    #[test]
+    fn run_explore_records_exchange_without_storing_context() {
+        let (agent, mut session) = agent(vec![ScriptedProvider::reply(
+            "explore-answer",
+            Some(FinishReason::Stop),
+        )]);
+        session.push(Message::user("earlier work"));
+        let outcome = agent.run_explore(
+            &mut session,
+            "[context] other-session summary",
+            "deep question",
+            None,
+            &mut sink(),
+        );
+        let AgentOutcome::Completed(result) = outcome else {
+            panic!("expected explore answer, got {outcome:?}");
+        };
+        assert_eq!(result.content, "explore-answer");
+        // Stored history holds the exchange (earlier + this turn) but never
+        // the context block itself.
+        let contents: Vec<&str> = session
+            .history()
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(
+            contents,
+            ["earlier work", "deep question", "explore-answer"]
+        );
+        assert!(
+            !contents.iter().any(|content| content.contains("[context]")),
+            "explore context must not persist: {contents:?}"
+        );
+        // The provider did see the context first: leading system message,
+        // then the real history.
+        let seen = agent.provider().seen.borrow();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].len() >= 3, "got: {:?}", seen[0]);
+        assert_eq!(seen[0][0].role, crate::Role::System);
+        assert!(seen[0][0].content.contains("[context]"));
+        assert_eq!(seen[0][1].content, "earlier work");
     }
 }
