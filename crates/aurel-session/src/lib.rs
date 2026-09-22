@@ -22,7 +22,8 @@ pub use id::SessionId;
 pub use store::{
     describe_age, explore_context, now_ms, SessionData, SessionMeta, SessionMode, SessionStore,
     SessionSummary, MAX_EXPLORE_CHARS_PER_SESSION, MAX_EXPLORE_SESSIONS, MAX_FILE_BYTES,
-    MAX_LISTED_SESSIONS, MAX_LOADED_MESSAGES, MAX_STORED_MESSAGES, SESSION_FORMAT,
+    MAX_LISTED_SESSIONS, MAX_LOADED_MESSAGES, MAX_STORED_MESSAGES, SESSION_COUNT_WARN_THRESHOLD,
+    SESSION_FORMAT,
 };
 
 /// What went wrong inside the session store. Every fallible operation

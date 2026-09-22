@@ -50,6 +50,11 @@ pub const MAX_EXPLORE_CHARS_PER_SESSION: usize = 500;
 /// Max sessions a `/sessions` listing parses (newest by mtime first).
 pub const MAX_LISTED_SESSIONS: usize = 100;
 
+/// Saved-session count above which `/sessions` suggests manual cleanup.
+/// Files are never pruned automatically — user data is deleted only by
+/// the user — but unbounded growth gets an honest, actionable notice.
+pub const SESSION_COUNT_WARN_THRESHOLD: usize = 200;
+
 /// The persisted interaction mode. Mirrors [`Mode`] without depending on
 /// its memory representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +168,22 @@ struct StoredFile {
     compactions: u32,
 }
 
+/// The listing shape: every envelope field except the history, whose
+/// messages are counted but never allocated. Parsing a 2 MiB session for
+/// `/sessions` therefore costs the file buffer (already bounded) plus a
+/// few hundred bytes — never the full message contents.
+#[derive(Debug, serde::Deserialize)]
+struct StoredMeta {
+    format: u32,
+    id: String,
+    created_ms: u64,
+    updated_ms: u64,
+    mode: String,
+    workdir: String,
+    #[serde(default)]
+    history: Vec<serde::de::IgnoredAny>,
+}
+
 /// Milliseconds since the Unix epoch (0 when the clock misbehaves — a
 /// display/sort value, never a security decision).
 pub fn now_ms() -> u64 {
@@ -212,6 +233,16 @@ impl SessionStore {
             message: format!("sessions directory is not writable: {e}"),
         })?;
         let _ = fs::remove_file(&probe);
+        // Best-effort cleanup of probe litter from crashed processes.
+        // Skipped files (permissions, races) simply remain for next time.
+        if let Ok(read) = fs::read_dir(dir) {
+            for entry in read.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with(".aurel-probe-") {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
         Ok(SessionStore {
             dir: dir.to_path_buf(),
         })
@@ -268,8 +299,11 @@ impl SessionStore {
             compactions: data.compactions,
         };
         // Shed oldest messages until the file fits (the summary goes last:
-        // it is the cheapest context per byte).
-        loop {
+        // it is the cheapest context per byte). The loop is iteration-
+        // bounded so even adversarial histories terminate; reaching one
+        // message without fitting means that message alone exceeds the
+        // file budget.
+        for _ in 0..MAX_STORED_MESSAGES {
             let bytes = serde_json::to_vec(&stored).map_err(|e| SessionError::Io {
                 path: self.file(&data.id).display().to_string(),
                 message: format!("cannot encode session: {e}"),
@@ -278,10 +312,7 @@ impl SessionStore {
                 return self.write_bytes(&data.id, &bytes);
             }
             if stored.history.len() <= 1 {
-                return Err(SessionError::TooLarge {
-                    path: self.file(&data.id).display().to_string(),
-                    limit: format!("{MAX_FILE_BYTES} bytes"),
-                });
+                break;
             }
             if is_compact_summary(&stored.history[0]) && stored.history.len() > 2 {
                 stored.history.remove(1);
@@ -289,6 +320,10 @@ impl SessionStore {
                 stored.history.remove(0);
             }
         }
+        Err(SessionError::TooLarge {
+            path: self.file(&data.id).display().to_string(),
+            limit: format!("{MAX_FILE_BYTES} bytes"),
+        })
     }
 
     fn write_bytes(&self, id: &SessionId, bytes: &[u8]) -> Result<(), SessionError> {
@@ -350,32 +385,16 @@ impl SessionStore {
         id: &SessionId,
         stored: StoredFile,
     ) -> Result<SessionData, SessionError> {
-        let corrupt = |reason: String| SessionError::Corrupt {
-            path: path.display().to_string(),
-            reason,
-        };
-        if stored.format != SESSION_FORMAT {
-            return Err(SessionError::Incompatible {
-                path: path.display().to_string(),
-                found: stored.format,
-            });
-        }
-        if stored.id != id.as_str() {
-            return Err(corrupt(format!(
-                "session ID '{}' does not match its filename",
-                clip_inline(&stored.id)
-            )));
-        }
-        if stored.history.len() > MAX_LOADED_MESSAGES {
-            return Err(corrupt(format!(
-                "session holds {} messages (max {MAX_LOADED_MESSAGES})",
-                stored.history.len()
-            )));
-        }
-        if stored.updated_ms < stored.created_ms {
-            return Err(corrupt("session timestamps run backwards".to_string()));
-        }
-        let mode = SessionMode::parse(&stored.mode).map_err(corrupt)?;
+        let mode = check_envelope(
+            path,
+            id,
+            stored.format,
+            &stored.id,
+            &stored.mode,
+            stored.created_ms,
+            stored.updated_ms,
+            stored.history.len(),
+        )?;
         Ok(SessionData {
             id: id.clone(),
             created_ms: stored.created_ms,
@@ -386,6 +405,46 @@ impl SessionStore {
             history: stored.history,
             iterations_used: stored.iterations_used,
             compactions: stored.compactions,
+        })
+    }
+
+    /// Metadata for one session file without loading its history (see
+    /// [`StoredMeta`]). Strict like [`SessionStore::load`]: any violation
+    /// is a typed error, and [`SessionStore::list`] skips failures.
+    fn meta_for(&self, id: &SessionId) -> Result<SessionMeta, SessionError> {
+        let path = self.file(id);
+        let bytes = fs::read(&path).map_err(|e| SessionError::Io {
+            path: path.display().to_string(),
+            message: format!("cannot read session file: {e}"),
+        })?;
+        if bytes.len() as u64 > MAX_FILE_BYTES {
+            return Err(SessionError::TooLarge {
+                path: path.display().to_string(),
+                limit: format!("{MAX_FILE_BYTES} bytes"),
+            });
+        }
+        let meta: StoredMeta =
+            serde_json::from_slice(&bytes).map_err(|e| SessionError::Corrupt {
+                path: path.display().to_string(),
+                reason: format!("invalid session JSON: {}", clip_error(&e.to_string())),
+            })?;
+        let mode = check_envelope(
+            &path,
+            id,
+            meta.format,
+            &meta.id,
+            &meta.mode,
+            meta.created_ms,
+            meta.updated_ms,
+            meta.history.len(),
+        )?;
+        Ok(SessionMeta {
+            id: id.clone(),
+            mode,
+            message_count: meta.history.len(),
+            workdir: meta.workdir,
+            created_ms: meta.created_ms,
+            updated_ms: meta.updated_ms,
         })
     }
 
@@ -438,9 +497,11 @@ impl SessionStore {
     }
 
     /// Newest-first metadata for `/sessions` (capped at
-    /// [`MAX_LISTED_SESSIONS`]). Unparseable files are skipped so one bad
-    /// file can never hide the rest; use [`SessionStore::load`] for strict
-    /// per-session errors.
+    /// [`MAX_LISTED_SESSIONS`]). Histories are counted, never loaded (see
+    /// [`StoredMeta`]), so a directory of large sessions lists in bounded
+    /// memory. Unparseable files are skipped so one bad file can never
+    /// hide the rest; use [`SessionStore::load`] for strict per-session
+    /// errors.
     pub fn list(&self) -> Vec<SessionMeta> {
         let mut entries: Vec<(String, u64)> = Vec::new();
         let read = match fs::read_dir(&self.dir) {
@@ -473,20 +534,30 @@ impl SessionStore {
                 Ok(id) => id,
                 Err(_) => continue,
             };
-            let data: SessionData = match self.load(id.as_str()) {
-                Ok(data) => data,
+            match self.meta_for(&id) {
+                Ok(meta) => metas.push(meta),
                 Err(_) => continue,
-            };
-            metas.push(SessionMeta {
-                id,
-                mode: data.mode,
-                message_count: data.history.len(),
-                workdir: data.workdir,
-                created_ms: data.created_ms,
-                updated_ms: data.updated_ms,
-            });
+            }
         }
         metas
+    }
+
+    /// Count saved sessions (valid IDs only, no file reads). Cheap enough
+    /// to call on every `/sessions` for the growth warning; files are never
+    /// pruned automatically.
+    pub fn count(&self) -> usize {
+        match fs::read_dir(&self.dir) {
+            Ok(read) => read
+                .flatten()
+                .filter(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    name.ends_with(".json")
+                        && !name.starts_with('.')
+                        && SessionId::parse(name.trim_end_matches(".json")).is_ok()
+                })
+                .count(),
+            Err(_) => 0,
+        }
     }
 
     /// Retrieval context for one `@explore` prompt: at most
@@ -511,6 +582,51 @@ impl SessionStore {
             })
             .collect()
     }
+}
+
+/// Shared envelope validation for full loads and metadata reads:
+/// format version, ID/filename agreement, message-count bound, timestamp
+/// order, and mode spelling. Anything else is a typed error naming the
+/// file — never a guess, never a panic.
+//
+// Eight parameters, each consumed once in validation order: bundling them
+// into a struct would only rename the call sites without clarifying them.
+#[allow(clippy::too_many_arguments)]
+fn check_envelope(
+    path: &Path,
+    id: &SessionId,
+    format: u32,
+    stored_id: &str,
+    mode: &str,
+    created_ms: u64,
+    updated_ms: u64,
+    message_count: usize,
+) -> Result<SessionMode, SessionError> {
+    let corrupt = |reason: String| SessionError::Corrupt {
+        path: path.display().to_string(),
+        reason,
+    };
+    if format != SESSION_FORMAT {
+        return Err(SessionError::Incompatible {
+            path: path.display().to_string(),
+            found: format,
+        });
+    }
+    if stored_id != id.as_str() {
+        return Err(corrupt(format!(
+            "session ID '{}' does not match its filename",
+            clip_inline(stored_id)
+        )));
+    }
+    if message_count > MAX_LOADED_MESSAGES {
+        return Err(corrupt(format!(
+            "session holds {message_count} messages (max {MAX_LOADED_MESSAGES})"
+        )));
+    }
+    if updated_ms < created_ms {
+        return Err(corrupt("session timestamps run backwards".to_string()));
+    }
+    SessionMode::parse(mode).map_err(corrupt)
 }
 
 /// The retrievable gist of one history: its compact summary when compacted,
@@ -539,7 +655,11 @@ fn is_compact_summary(message: &Message) -> bool {
 }
 
 fn single_line(text: &str, max_chars: usize) -> String {
-    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Clip before flattening: blurb inputs can be megabytes (full model
+    // replies), and nothing past max_chars survives anyway. The join below
+    // then stays tiny no matter the input size.
+    let head: String = text.chars().take(max_chars + 1).collect();
+    let flat: String = head.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() > max_chars {
         let clipped: String = flat.chars().take(max_chars).collect();
         format!("{clipped}…")
@@ -870,5 +990,67 @@ mod tests {
         let file = dir.join("blocker");
         fs::write(&file, b"x").expect("write");
         assert!(SessionStore::open(&file.join("sub")).is_err());
+    }
+
+    #[test]
+    fn listing_counts_histories_without_loading_them() {
+        // A max-size session (200 messages with 4 KiB bodies ≈ 0.8 MiB)
+        // must list with the right count through the metadata path.
+        let store = store("list-meta");
+        let mut data = sample_data(&store);
+        data.history = (0..MAX_STORED_MESSAGES)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::user(format!("q{i} {}", "y".repeat(4096)))
+                } else {
+                    Message::assistant(format!("a{i} {}", "z".repeat(4096)))
+                }
+            })
+            .collect();
+        store.save(&data).expect("save large");
+        let listed = store.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].message_count, MAX_STORED_MESSAGES);
+        assert_eq!(listed[0].id, data.id);
+        assert_eq!(store.count(), 1);
+    }
+
+    #[test]
+    fn count_tracks_saves_and_probe_litter_is_cleaned() {
+        let dir = test_dir("count-probe");
+        let store = SessionStore::open(&dir).expect("open");
+        assert_eq!(store.count(), 0);
+        // Stale probe files from a crashed process are removed on open.
+        fs::write(dir.join(".aurel-probe-999999"), b"stale").expect("plant probe");
+        fs::write(dir.join("not-a-session.txt"), b"x").expect("plant junk");
+        let store = SessionStore::open(&dir).expect("reopen");
+        assert!(!dir.join(".aurel-probe-999999").exists());
+        assert!(
+            dir.join("not-a-session.txt").exists(),
+            "only probes are cleaned"
+        );
+        for _ in 0..3 {
+            let data = sample_data(&store);
+            store.save(&data).expect("save");
+        }
+        assert_eq!(store.count(), 3);
+        assert_eq!(store.list().len(), 3);
+    }
+
+    #[test]
+    fn blurbs_stay_bounded_on_huge_inputs() {
+        // A 1 MiB single-word reply must reduce to a capped blurb without
+        // ever materializing megabyte intermediate strings beyond the
+        // input itself.
+        let huge = "w".repeat(1024 * 1024);
+        let history = vec![Message::user("tiny question"), Message::assistant(huge)];
+        let blurb = blurb_of(&history).expect("blurb");
+        assert!(
+            blurb.chars().count() <= MAX_EXPLORE_CHARS_PER_SESSION + 1,
+            "blurb unbounded: {} chars",
+            blurb.chars().count()
+        );
+        // Short inputs keep their exact shape (no spurious markers).
+        assert_eq!(blurb_of(&[Message::user("hi")]).as_deref(), Some("hi"));
     }
 }

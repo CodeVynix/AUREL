@@ -1,6 +1,6 @@
-# AUREL Architecture — Phase 9
+# AUREL Architecture — Phase 10
 
-This document describes what Phase 9 actually contains. Nothing more.
+This document describes what Phase 10 actually contains. Nothing more.
 
 ## Workspace
 
@@ -270,6 +270,41 @@ blurbs (500 chars each) plus project metadata ride that request as a
 leading `system` message on a private clone, then only the exchanged
 turn is copied back — the context never enters stored history.
 
+## Hardening + performance
+
+Phase 10 changes no architecture and no interaction contract: it bounds
+every remaining open-ended input, verifies every trust boundary, and
+measures against the resource targets. Concretely:
+
+- Fence scanning caps each payload at 1 MiB (`MAX_FENCE_PAYLOAD_BYTES`):
+  oversized fences become one note while later fences still parse, so a
+  compromised endpoint cannot balloon memory through model output.
+- Compaction transcripts cap at 500 messages
+  (`MAX_COMPACT_TRANSCRIPT_MESSAGES`) with an explicit omission marker;
+  per-line clipping (2000 chars) is unchanged.
+- `/sessions` parses metadata without loading histories (`StoredMeta`
+  with ignored message bodies), so 100 large sessions list in bounded
+  memory; full loads still serve `/resume` and `@explore` (≤5 files).
+- Blurbs clip before flattening, so megabyte replies reduce without
+  megabyte temporaries; the session save loop is iteration-bounded.
+- Session files accumulate until the user deletes them — never pruned
+  automatically — with a reclaim notice past 200 files (`/sessions`
+  also admits when its 100-row cap truncates).
+- Crash litter is cleaned best-effort (stale `.aurel-probe-*` on store
+  open); atomic writes keep the last good file on failure; save failures
+  warn and continue in memory.
+- Verified by review (no new findings): one shared `ureq::Agent` per
+  process (no per-request pooling loss), absolute `git` paths pinned at
+  prepare (no PATH re-lookup at apply), no panics on any runtime path
+  (only tests `expect`), saturating arithmetic on clock math.
+
+Measured on Windows 11 / Athlon 300U (see README for methodology):
+startup ~20–40 ms warm (<250 ms target), minimal-path peak ~5 MB and
+active-turn peak ~6.3 MB (30/80 MB targets; 100 MB warning and 150 MB
+regression thresholds hold 12–20× headroom), steady-state model turns
+~75 ms wall, 3.3 MiB release binary (<15 MB) as the whole installed
+footprint (<25 MB, models excluded).
+
 ## Configuration
 
 `log_level`, the `[model]` table (`name`, `base_url`, optional
@@ -450,3 +485,15 @@ graph entries, no async.
   Still far under the < 15 MB Core target.
 - Startup, warm process start-to-exit: release `--version` — unchanged;
   the store opens once per loop and costs nothing at startup.
+
+## Phase 10 delta (measured, informational)
+
+Same host and caveats as above. No new crates, no new dependencies, no
+async — only caps, a metadata parse path, cleanup/notice affordances,
+and regression tests.
+
+- Release binary: 3,497,984 bytes (≈3.34 MiB), i.e. +23,040 bytes
+  (+0.7%) vs Phase 9, mostly new bounds and tests rather than
+  dependencies. Still far under the < 15 MB Core target.
+- Startup, warm process start-to-exit: release `--version` ≈20–40 ms —
+  unchanged; hardening adds no startup work (bounds check inline).

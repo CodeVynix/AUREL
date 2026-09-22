@@ -945,7 +945,12 @@ impl<P: ModelProvider> Repl<P> {
             let _ = writeln!(out, "No saved sessions yet.");
             return;
         }
-        let _ = writeln!(out, "sessions ({}):", listed.len());
+        let total = store.count();
+        if total > listed.len() {
+            let _ = writeln!(out, "sessions ({} shown of {} total):", listed.len(), total);
+        } else {
+            let _ = writeln!(out, "sessions ({}):", listed.len());
+        }
         for meta in listed {
             let marker = if meta.id == self.session_id { "*" } else { " " };
             let _ = writeln!(
@@ -956,6 +961,15 @@ impl<P: ModelProvider> Repl<P> {
                 meta.message_count,
                 aurel_session::describe_age(meta.updated_ms),
                 meta.workdir
+            );
+        }
+        // Growth notice, never pruning: session files accumulate until the
+        // user deletes them; past the threshold the listing says so.
+        if total > aurel_session::SESSION_COUNT_WARN_THRESHOLD {
+            let _ = writeln!(
+                out,
+                "note: {total} saved sessions — delete old files in '{}' to reclaim disk.",
+                store.dir().display()
             );
         }
     }
@@ -3307,5 +3321,41 @@ mod tests {
         // Plain prompts still work in memory.
         let (cont, _, _) = dispatch_to_string(&mut repl, &InputKind::Slash(SlashCommand::Status));
         assert!(cont);
+    }
+
+    #[test]
+    fn sessions_warns_about_disk_growth_without_pruning() {
+        let store = test_store("growth");
+        // Past the warning threshold with tiny empty-history sessions.
+        for _ in 0..=aurel_session::SESSION_COUNT_WARN_THRESHOLD {
+            let id = store.create_id();
+            store
+                .save(&aurel_session::SessionData {
+                    id,
+                    created_ms: 0,
+                    updated_ms: 0,
+                    mode: aurel_session::SessionMode::Build,
+                    workdir: "w".into(),
+                    project_kind: None,
+                    history: Vec::new(),
+                    iterations_used: 0,
+                    compactions: 0,
+                })
+                .expect("save");
+        }
+        let workdir = session_workdir("growth");
+        let mut repl = test_repl_in_store(vec![], workdir.clone(), Some(store));
+        let (cont, out, _) =
+            dispatch_to_string(&mut repl, &InputKind::Slash(SlashCommand::Sessions));
+        assert!(cont);
+        assert!(
+            out.contains("shown of"),
+            "listing must admit truncation: {out:?}"
+        );
+        assert!(
+            out.contains("reclaim disk"),
+            "growth needs a notice: {out:?}"
+        );
+        let _ = std::fs::remove_dir_all(&workdir);
     }
 }

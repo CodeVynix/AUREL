@@ -44,6 +44,13 @@ pub const FENCE_TAG: &str = "aurel-mutation";
 /// Max proposal blocks honored per model reply (runaway-queue guard).
 pub const MAX_PROPOSALS_PER_RUN: usize = 8;
 
+/// Max bytes accumulated for one fence payload before it is ignored.
+/// Legitimate fences carry at most [`Limits::max_write_bytes`] of file
+/// content plus JSON framing; anything past 1 MiB is a compromised or
+/// malfunctioning endpoint trying to balloon memory, so the fence is
+/// skipped (later fences still parse) instead of buffered.
+pub const MAX_FENCE_PAYLOAD_BYTES: usize = 1024 * 1024;
+
 /// Max diff lines rendered per proposal before a truncation marker.
 pub const MAX_DIFF_LINES: usize = 100;
 
@@ -463,8 +470,10 @@ fn decode_op(payload: &str) -> Result<MutationOp, ProposalError> {
 ///
 /// Returns `(operations, notes)`: valid operations in reply order alongside
 /// human-readable notes for everything skipped (unclosed fences, malformed
-/// JSON, unknown shapes). Never panics; oversized payloads are checked
-/// later against [`Limits::max_write_bytes`] at prepare time.
+/// JSON, unknown shapes, oversized payloads). Never panics; oversized
+/// payloads are skipped during scanning (see [`MAX_FENCE_PAYLOAD_BYTES`])
+/// and oversized file contents are checked again against
+/// [`Limits::max_write_bytes`] at prepare time.
 pub fn parse_proposals(text: &str) -> (Vec<MutationOp>, Vec<String>) {
     let mut operations = Vec::new();
     let mut notes = Vec::new();
@@ -484,10 +493,21 @@ pub fn parse_proposals(text: &str) -> (Vec<MutationOp>, Vec<String>) {
         }
         let mut payload = String::new();
         let mut closed = false;
+        let mut oversized = false;
         for fence_line in lines.by_ref() {
             if fence_line.trim_start().starts_with("```") {
                 closed = true;
                 break;
+            }
+            // Bound the buffer: keep consuming to the closing fence (so
+            // later fences still parse) without retaining the bytes.
+            if oversized {
+                continue;
+            }
+            if payload.len() + fence_line.len() + 1 > MAX_FENCE_PAYLOAD_BYTES {
+                oversized = true;
+                payload.clear();
+                continue;
             }
             payload.push_str(fence_line);
             payload.push('\n');
@@ -495,6 +515,12 @@ pub fn parse_proposals(text: &str) -> (Vec<MutationOp>, Vec<String>) {
         if !closed {
             notes.push("ignored unclosed aurel-mutation fence".to_string());
             break;
+        }
+        if oversized {
+            notes.push(format!(
+                "ignored oversized aurel-mutation fence (exceeds {MAX_FENCE_PAYLOAD_BYTES} bytes)"
+            ));
+            continue;
         }
         match decode_op(&payload) {
             Ok(op) => operations.push(op),
@@ -1411,6 +1437,41 @@ mod tests {
         let (operations, notes) = parse_proposals("```rust\nlet x = 1;\n```\n");
         assert!(operations.is_empty());
         assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn oversized_fences_skip_without_buffering_or_blocking_later_ones() {
+        // A 5 MiB fence (hostile or malfunctioning endpoint) must not end
+        // up buffered: it becomes one note, and the fence after it still
+        // parses.
+        let big = "x".repeat(5 * 1024 * 1024);
+        let text = format!(
+            "```aurel-mutation\n{{\"op\": \"delete_file\", \"path\": \"{big}\"}}\n```\n```aurel-mutation\n{{\"op\": \"delete_file\", \"path\": \"ok.txt\"}}\n```\n"
+        );
+        let (operations, notes) = parse_proposals(&text);
+        assert_eq!(
+            operations,
+            vec![MutationOp::DeleteFile {
+                path: "ok.txt".into()
+            }],
+            "later fences must still parse"
+        );
+        assert!(
+            notes.iter().any(|note| note.contains("oversized")),
+            "oversized fence needs a note: {notes:?}"
+        );
+        // Exactly at the cap still parses (boundary, not off-by-one): one
+        // JSON line whose stored bytes total MAX_FENCE_PAYLOAD_BYTES.
+        let shell = r#"{"op": "delete_file", "path": ""}"#.len();
+        let pad = "p".repeat(MAX_FENCE_PAYLOAD_BYTES - 1 - shell);
+        let exact =
+            format!("```aurel-mutation\n{{\"op\": \"delete_file\", \"path\": \"{pad}\"}}\n```\n");
+        let (operations, notes) = parse_proposals(&exact);
+        assert!(notes.is_empty(), "at-cap fence must parse: {notes:?}");
+        assert!(
+            matches!(operations.as_slice(), [MutationOp::DeleteFile { .. }]),
+            "got: {operations:?}"
+        );
     }
 
     #[test]

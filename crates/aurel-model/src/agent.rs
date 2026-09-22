@@ -21,6 +21,11 @@ pub const COMPACT_AT_MESSAGES: usize = 20;
 pub const COMPACT_KEEP_MESSAGES: usize = 4;
 /// Per-message transcript cap (characters) when asking for a summary.
 pub const COMPACT_MESSAGE_CHARS: usize = 2000;
+/// Max messages folded into one summary request. With auto-compaction on
+/// the prefix is tiny; with it off (or a giant manual `/compact`) the
+/// request is capped to the newest messages with an explicit marker, so
+/// one compaction can never build a gigabyte prompt.
+pub const MAX_COMPACT_TRANSCRIPT_MESSAGES: usize = 500;
 
 /// Continuation cue appended (as `system`) after a truncated turn so the
 /// next request deterministically asks for the rest instead of repeating
@@ -421,13 +426,23 @@ impl<P: ModelProvider> Agent<P> {
             });
         }
         let split = before - COMPACT_KEEP_MESSAGES;
+        // Newest-first window: the summary covers what the request
+        // carries; anything older is named by the marker, never silently
+        // absorbed. Numbering keeps original 1-based positions.
+        let omitted = split.saturating_sub(MAX_COMPACT_TRANSCRIPT_MESSAGES);
+        let window_start = split - split.min(MAX_COMPACT_TRANSCRIPT_MESSAGES);
         let mut transcript = String::new();
+        if omitted > 0 {
+            transcript.push_str(&format!(
+                "…[{omitted} earlier message(s) omitted from the summary request]\n"
+            ));
+        }
         // Role labels use Debug introspection, not wire spellings (those
         // belong to providers): the transcript is prompt text, not protocol.
-        for (i, message) in session.history[..split].iter().enumerate() {
+        for (i, message) in session.history[window_start..split].iter().enumerate() {
             transcript.push_str(&format!(
                 "{}. [{:?}] {}\n",
-                i + 1,
+                window_start + i + 1,
                 message.role,
                 message.content
             ));
@@ -1044,6 +1059,42 @@ mod tests {
         assert_eq!(report.messages_after, 4);
         assert_eq!(report.summary_chars, 0);
         assert_eq!(agent.provider().calls.get(), 0);
+    }
+
+    #[test]
+    fn compact_caps_giant_transcripts_with_a_marker() {
+        // 600 pairs (1200 messages): the summary request must stay bounded
+        // instead of folding the whole history into one prompt.
+        let (agent, mut session) = agent(vec![ScriptedProvider::reply(
+            "SUMMARY",
+            Some(FinishReason::Stop),
+        )]);
+        for i in 0..600 {
+            session.push(Message::user(format!("question {i}")));
+            session.push(Message::assistant(format!("answer {i}")));
+        }
+        let report = agent.compact(&mut session, None).expect("compact");
+        assert_eq!(report.messages_before, 1200);
+        assert_eq!(report.messages_after, COMPACT_KEEP_MESSAGES + 1);
+        // The provider saw the marker plus at most the capped window.
+        let seen = agent.provider().seen.borrow();
+        assert_eq!(seen.len(), 1);
+        let transcript = &seen[0][1].content;
+        assert!(
+            transcript.contains("omitted from the summary request"),
+            "giant histories must be marked: {transcript:?}"
+        );
+        assert!(
+            transcript.lines().count() <= MAX_COMPACT_TRANSCRIPT_MESSAGES + 2,
+            "transcript unbounded: {} lines",
+            transcript.lines().count()
+        );
+        assert!(
+            transcript.contains("question 597"),
+            "the window keeps the newest context"
+        );
+        // History itself compacted normally around the summary.
+        assert!(session.history()[0].content.starts_with("Session summary:"));
     }
 
     #[test]

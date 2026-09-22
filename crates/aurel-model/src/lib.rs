@@ -19,7 +19,8 @@ mod types;
 
 pub use agent::{
     Agent, AgentConfig, AgentOutcome, AgentResult, AgentSession, CompactReport, Mode,
-    COMPACT_AT_MESSAGES, COMPACT_KEEP_MESSAGES, MAX_ITERATIONS_LIMIT,
+    COMPACT_AT_MESSAGES, COMPACT_KEEP_MESSAGES, MAX_COMPACT_TRANSCRIPT_MESSAGES,
+    MAX_ITERATIONS_LIMIT,
 };
 pub use error::ProviderError;
 pub use openai::{OpenAiCompatible, OpenAiConfig};

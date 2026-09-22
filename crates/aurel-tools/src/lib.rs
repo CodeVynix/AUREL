@@ -39,5 +39,5 @@ pub use instructions::{
 pub use mutation::{
     parse_proposals, prepare_proposal, render_diff, verify_fresh, AppliedChange, CommandKind,
     MutationOp, PendingProposal, ProposalError, ResolvedOp, FENCE_TAG, MAX_DIFF_LINES,
-    MAX_PROPOSALS_PER_RUN,
+    MAX_FENCE_PAYLOAD_BYTES, MAX_PROPOSALS_PER_RUN,
 };

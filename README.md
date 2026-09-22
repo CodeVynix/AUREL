@@ -4,13 +4,13 @@ AUREL is a personal, terminal-first AI coding agent. This repository holds its
 Rust implementation, built as one shared foundation with a lightweight Core
 edition and (later) an extended Normal edition.
 
-> **Status: Phase 9 — Context + session resumption.** Conversations
-> persist as bounded JSON sessions (`/sessions`, `/resume <id>`) with
-> stable IDs, and `@explore` pulls other sessions' summaries into one
-> prompt only. Resuming restores history, mode, and counters — never
-> proposals, undo records, instructions, or secrets, so it executes
-> nothing. There is still no memory beyond saved sessions, no GUI, and no
-> Normal edition.
+> **Status: Phase 10 — Hardening + performance.** Trust boundaries
+> reviewed and bounded with no architecture or interaction changes:
+> fence payloads, compaction transcripts, session listing, blurbs, and
+> stored history all carry explicit caps backed by regression tests.
+> Measured with headroom to spare: ~5–8 MB peak RSS (targets 30 idle /
+> 80 active), ~20–40 ms warm startup (<250 ms), ~75 ms steady-state
+> model turns, 3.3 MiB release binary (<15 MB). Still no Normal edition.
 
 ## Toolchain
 
@@ -71,13 +71,13 @@ plan> hello
 Actual `--version` output:
 
 ```text
-aurel 0.10.0
+aurel 0.11.0
 ```
 
 Actual `--help` output:
 
 ```text
-aurel 0.10.0
+aurel 0.11.0
 Autonomous Utility & Reasoning Engine for Logic
 
 USAGE:
@@ -115,7 +115,7 @@ Behavior:
 | ---------- | --------- | ------ |
 | `aurel` | 0 | help to stdout (config files untouched) |
 | `aurel --help` / `-h` | 0 | help to stdout |
-| `aurel --version` / `-V` | 0 | `aurel 0.10.0` to stdout |
+| `aurel --version` / `-V` | 0 | `aurel 0.11.0` to stdout |
 | `aurel config show` | 0 | effective config as TOML to stdout (key redacted) |
 | `aurel config` / `aurel config --help` | 0 | command help to stdout |
 | `aurel chat "hi"` | 0 | model reply to stdout |
@@ -289,6 +289,31 @@ purely in memory and says so.
 `@explore` answers with real cross-session context: up to 5 other
 sessions' summaries (500 chars each) plus project metadata ride that one
 request as a leading `system` message — never stored in history.
+
+## Performance (measured, Windows 11 / Athlon 300U)
+
+Methodology: peak RSS via post-exit `PeakWorkingSetSize` (validated
+against live polling); startup via warm process timing; the active path
+via `chat`/`agent` against a localhost stub at steady state. First-run
+cold (~1.2 s) is stub-JIT plus Windows process/disk-cache effects, not
+AUREL logic; the REPL itself was not drivable without a PTY, so idle is
+bounded analytically (minimal path plus capped session state).
+
+| Target | Measured |
+| ------ | -------- |
+| startup <250 ms | ~20–40 ms warm (`--version`) |
+| idle RSS <30 MB | ~5 MB minimal path; <12 MB analytic bound with a maxed session |
+| active model <80 MB | ~6.3 MB peak (one-shot turn vs stub, ~75 ms steady-state) |
+| warning 100 MB / regression 150 MB | 12–20× headroom on every path |
+| release binary <15 MB | 3.3 MiB |
+| installed footprint <25 MB (no models) | one 3.3 MiB binary |
+
+Every unbounded-feeling input carries an explicit cap, each with a
+regression test: fence payloads 1 MiB, compaction transcripts 500
+messages, stored sessions 200 messages / 2 MiB per file, listings 100
+rows, explore 5×500 chars, command output 1 MiB per stream, diffs 100
+lines. Session files accumulate until the user deletes them; past 200
+files `/sessions` says so instead of pruning data.
 
 ## Project instructions (`AGENTS.md`)
 
