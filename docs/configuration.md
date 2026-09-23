@@ -54,7 +54,9 @@ flag parser (exit 2) and by the loop (exit 1) alike.
 
 `auto_compaction` triggers a model-made summary once history passes 20
 messages (newest 4 kept). `/settings set auto_compaction on|off` toggles it
-for the running session only — Phase 4 performs no file writes.
+for the running session only — settings changes are session-scoped and
+never written to config files (the approval workflow and the session
+store are the only writers, and neither touches configuration).
 
 ## Precedence
 

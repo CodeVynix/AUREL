@@ -77,8 +77,10 @@ provider module. Everything is blocking — no async runtime (ADR-0006).
 The API key travels in exactly one place — the `Authorization: Bearer`
 header — and `base_url` must be `http(s)://` with a host and no embedded
 credentials. POSTs are never forwarded across redirects, so keys cannot
-hop hosts. System proxy environment is honored per the HTTP client's
-defaults. A custom `aurel/<version>` User-Agent is sent.
+hop hosts. No proxy is ever configured, so proxy environment variables
+are ignored and requests — including loopback endpoints — cannot be
+diverted (the test suite additionally strips them). A custom
+`aurel/<version>` User-Agent is sent.
 
 Capabilities are reported conservatively — only what AUREL implements and
 verifies today (`streaming: true`; tool-calling, structured output, and
@@ -110,9 +112,10 @@ full response.
   already blocked inside the OS socket still waits out the transport's
   overall timeout — single-threaded synchronous code cannot preempt it
   without threads or async, which Core deliberately avoids. In every other
-  position cancellation is prompt. `aurel chat` itself relies on the
-  timeout and normal process termination; the flag exists for the future
-  agent loop.
+  position cancellation is prompt. The agent loop threads the same flag
+  through every provider call and checks it explicitly between iterations.
+  There is no OS signal wiring: Ctrl-C terminates the process normally
+  (the interactive loop has already autosaved every completed turn).
 
 ## Errors
 

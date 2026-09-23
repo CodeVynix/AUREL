@@ -100,4 +100,33 @@ mod tests {
         assert!(text.starts_with("error:"));
         assert!(text.contains("/sessions"));
     }
+
+    #[test]
+    fn session_mode_round_trips_through_spellings() {
+        assert_eq!(SessionMode::Build.as_str(), "build");
+        assert_eq!(SessionMode::Plan.as_str(), "plan");
+        assert_eq!(SessionMode::parse("build"), Ok(SessionMode::Build));
+        assert_eq!(SessionMode::parse("plan"), Ok(SessionMode::Plan));
+        assert!(SessionMode::parse("turbo").is_err());
+        assert!(SessionMode::parse("").is_err());
+        assert_eq!(
+            SessionMode::from(aurel_model::Mode::Build),
+            SessionMode::Build
+        );
+        assert_eq!(
+            aurel_model::Mode::from(SessionMode::Plan),
+            aurel_model::Mode::Plan
+        );
+    }
+
+    #[test]
+    fn describe_age_handles_fresh_and_skewed_clocks() {
+        let now = now_ms();
+        assert_eq!(describe_age(now), "0s");
+        assert_eq!(describe_age(now.saturating_sub(90_000)), "1m");
+        assert_eq!(describe_age(now.saturating_sub(5 * 3_600_000)), "5h");
+        assert_eq!(describe_age(now.saturating_sub(3 * 86_400_000)), "3d");
+        // Future timestamps (clock skew) saturate instead of wrapping.
+        assert_eq!(describe_age(now.saturating_add(60_000)), "0s");
+    }
 }

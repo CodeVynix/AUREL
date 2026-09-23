@@ -175,7 +175,7 @@ one-shot (`aurel agent "hi"`, `aurel chat "hi"`, `aurel config show`).
 | `/settings [show\|set auto_compaction on\|off]` | Session-scoped settings |
 | `/config` | Effective config (key redacted) |
 | `/model` | Honestly reports its backend is unimplemented |
-| `/tools` | List registered tools (all read-only in this phase) |
+| `/tools` | List registered tools (read-only inspection) |
 | `/init [--force]` | Create `AGENTS.md` starter (never overwrites silently) |
 | `/approve [#id]`, `/deny [#id]` | Apply / drop the pending proposal (Build only) |
 | `/diff` | Re-show the pending proposal diff |
@@ -351,6 +351,7 @@ crates/aurel-session/      # stable IDs + bounded JSON session store (serde only
 crates/aurel-cli/           # `aurel` binary: std-only arg parser + dispatch + interactive loop
 docs/architecture.md        # what the current phase actually contains
 docs/configuration.md      # config precedence, grammar, errors
+CHANGELOG.md               # release notes per version
 docs/model-providers.md     # model setup, chat, streaming, errors, secrets
 docs/decisions/             # ADRs for the foundation choices
 .github/workflows/ci.yml    # fmt + clippy + build + test

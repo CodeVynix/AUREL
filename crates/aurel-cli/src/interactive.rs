@@ -1,11 +1,11 @@
-//! Interactive layer (Phase 4): modes, slash commands, `@` scopes, the `!`
-//! shell-request boundary, `/btw`, `/compact`, `/new`, and a minimal REPL.
+//! Interactive layer: modes, slash commands, `@` scopes (including real
+//! `@explore` cross-session retrieval), the `!` shell-request boundary,
+//! `/btw`, `/compact`, `/new`, persistent sessions, and a minimal REPL.
 //!
 //! Slash commands are handled locally and never reach the model as prompts.
-//! Backends that belong to later phases (`/model`, shell execution,
-//! cross-session retrieval) report that honestly instead of pretending to
-//! work. No TUI framework: plain line I/O over injected streams, so every
-//! path is unit-testable.
+//! The one remaining unimplemented backend (`/model`) reports that honestly
+//! instead of pretending to work. No TUI framework: plain line I/O over
+//! injected streams, so every path is unit-testable.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, Write};
@@ -56,8 +56,8 @@ pub enum InputKind {
     },
 }
 
-/// Local slash commands. Anything whose backend lives in a later phase
-/// reports that at dispatch time.
+/// Local slash commands. The one backend that remains unimplemented
+/// (`/model`) reports that at dispatch time instead of pretending.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
     Help,
@@ -1062,7 +1062,7 @@ impl<P: ModelProvider> Repl<P> {
     }
 
     fn print_tools(&self, out: &mut dyn Write) {
-        let _ = writeln!(out, "Tools (all read-only in this phase):");
+        let _ = writeln!(out, "Tools (read-only inspection):");
         for tool in aurel_tools::tool_catalog() {
             let _ = writeln!(
                 out,
@@ -1543,7 +1543,7 @@ Commands (local — never sent to the model):
   /settings [show|set]  View or change session settings
   /model                Not implemented yet
   /config               Show effective configuration (key redacted)
-  /tools                List registered tools (all read-only in this phase)
+   /tools                List registered tools (read-only inspection)
   /init [--force]       Create AGENTS.md starter (never overwrites silently)
    /approve [#id]        Apply the pending proposal (Build mode only)
    /deny [#id]           Drop the pending proposal without executing

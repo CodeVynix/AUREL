@@ -497,3 +497,49 @@ and regression tests.
   dependencies. Still far under the < 15 MB Core target.
 - Startup, warm process start-to-exit: release `--version` ≈20–40 ms —
   unchanged; hardening adds no startup work (bounds check inline).
+
+## Core freeze (Phase 11)
+
+Phase 11 freezes the architecture described above as AUREL Core 0.11.0.
+Stabilization only: version-identity audit, first-run/error-path review,
+doc-drift fixes, focused regression tests, CHANGELOG, and this
+statement. No features, no new dependencies, no interaction changes.
+
+Stable (frozen) Core surface: Rust-only workspace; CLI plus interactive
+REPL with the text→agent, `/`→local, `@`→context, `!`→shell,
+Tab→Plan/Build contract; Plan/Build modes with the approval gate;
+provider abstraction plus the OpenAI-compatible implementation; bounded
+agent loop; read-only tools; the file/shell/local-Git approval workflow
+with stale checks and session-scoped undo; persistent sessions with
+`/sessions`, `/resume`, `/new`, real `@explore`, `/btw` isolation, and
+`/compact`; `AGENTS.md` instructions kept out of history and off disk;
+workspace sandboxing; secret env filtering and output redaction;
+cancellation and bounded behavior on every path; the documented resource
+targets, all currently held with headroom.
+
+Intentionally deferred (not Core, not started): the Normal edition and
+any second binary; provider ecosystem work, routing, and integrations
+beyond OpenAI-compatible endpoints; remote Git automation
+(push/pull/fetch/merge/rebase) and PR creation; Desktop UI and Voice;
+telemetry/analytics; mandatory paid services; an async runtime (returns
+only with a measured requirement plus an ADR); `/model` switching.
+
+Release blockers: none found. The full gate is green (fmt, clippy,
+300+ tests online and offline, release build, diff check), the binary
+identifies 0.11.0, fresh-environment runs behave per the CLI contract,
+and measurements hold every target. The release artifact is the single
+`target/release/aurel` binary — no installer, no tag, no published
+release (all deliberately out of scope for this phase).
+
+Release checklist (how to re-verify): `cargo fmt --check`; `cargo clippy
+--workspace --all-targets --all-features -- -D warnings`; `cargo test
+--workspace`; `cargo test --workspace --offline`; `cargo build
+--workspace --release`; `git diff --check`; confirm `--version`
+reports the workspace version; spot-check `--help`, an invalid flag, a
+missing `--config` file, and one stub-driven model turn.
+
+Technical debt carried into Phase 12+: REPL idle RSS deserves a sampled
+(rather than analytic) number once a PTY harness exists; session-file
+accumulation stays manual by design; first-run cold-start cost is OS
+dominated and unoptimized; the stub measurement harness remains
+throwaway rather than committed infrastructure.

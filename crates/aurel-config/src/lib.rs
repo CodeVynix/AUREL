@@ -928,6 +928,31 @@ mod tests {
     }
 
     #[test]
+    fn sessions_dir_resolution_mirrors_config_convention() {
+        // Sessions live beside the global config: same `aurel` home, so
+        // one directory pair explains all AUREL state on every platform.
+        let resolved = global_sessions_dir(Some("C:\\Users\\t\\AppData\\Roaming"), Some("/home/t"));
+        let resolved = resolved.expect("resolvable");
+        #[cfg(windows)]
+        assert_eq!(
+            resolved,
+            PathBuf::from("C:\\Users\\t\\AppData\\Roaming")
+                .join("aurel")
+                .join("sessions")
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            resolved,
+            PathBuf::from("/home/t")
+                .join(".config")
+                .join("aurel")
+                .join("sessions")
+        );
+        assert!(global_sessions_dir(Some(""), Some("")).is_none());
+        assert!(global_sessions_dir(None, None).is_none());
+    }
+
+    #[test]
     fn project_discovery_prefers_nearest_and_stops() {
         let dir = test_dir("discovery");
         let outer = dir.join(".aurel").join("config.toml");
